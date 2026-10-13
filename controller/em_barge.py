@@ -146,6 +146,51 @@ def decide(*,
     return BargeDecision(False, "")
 
 
+class ManyDecision(NamedTuple):
+    fired: bool
+    note: str
+    # The model that fired, or the highest-scoring one when none did.
+    model: str
+    score: float
+    # The bar that model was judged against this frame.
+    threshold: float
+
+
+def decide_many(*,
+                scores: dict[str, float],
+                prev_scores: dict[str, float],
+                in_playback: bool,
+                barge_threshold: float,
+                wake_thresholds: dict[str, float]) -> ManyDecision:
+    """
+    `decide` for an Echo listening for several wake words (#112).
+
+    Each model is decided on its OWN scores: two consecutive frames of one
+    model, never one frame of each, since two models each half-matching
+    different frames is not a wake word. While thinking each model has its own
+    wake threshold; the playback bar is shared. Of the models that fired, the
+    highest score names the barge, which is the wake word whose pipeline the
+    interrupting turn asks for. `prev_scores` is the previous frame's scores,
+    empty for a watcher's first frame, for `decide`'s reason.
+    """
+    fired: list[tuple[float, str, str]] = []
+    for model, score in scores.items():
+        d = decide(score=score,
+                   prev_score=prev_scores.get(model, 0.0),
+                   in_playback=in_playback,
+                   barge_threshold=barge_threshold,
+                   wake_threshold=wake_thresholds[model])
+        if d.fired:
+            fired.append((score, model, d.note))
+    if fired:
+        score, model, note = max(fired)
+    else:
+        model = max(scores, key=lambda m: scores[m])
+        score, note = scores[model], ""
+    threshold = barge_threshold if in_playback else wake_thresholds[model]
+    return ManyDecision(bool(fired), note, model, score, threshold)
+
+
 class CedeVerdict(NamedTuple):
     # Give up the interrupting turn: playback has already stopped and stays
     # stopped, and this device does not run the turn. Both reasons below set

@@ -88,8 +88,8 @@ import em_runbarrier
 import em_earlytts
 import em_speechgate
 import em_wav
-import em_oww_models
-import em_oww_metadata
+import em_wake_models
+import em_wake_sync
 import em_player
 import em_tasks
 import em_timers
@@ -354,9 +354,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         device_id: str,
         label: str,
         mac_address: str,
-        oww_model_id: str,
         on_disconnected_cb,
-        oww_model_info,
         owning_server=None,   # DeviceESPhomeServer — back-reference so the
                               # standalone-announce path can read the live
                               # _standalone_play callback rather than a
@@ -372,8 +370,6 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         self.device_id      = device_id
         self.label          = label
         self.mac_address    = mac_address
-        self.oww_model_id   = oww_model_id
-        self.oww_model_info = oww_model_info
         self._owning_server  = owning_server
         # Strong references to in-flight timer-event tasks (see the
         # VoiceAssistantTimerEventResponse branch).
@@ -705,41 +701,52 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         if isinstance(msg, api_pb2.VoiceAssistantConfigurationRequest):
             log.debug(f"[{self._log_name}] VoiceAssistantConfigurationRequest")
             # HA's picker shows whatever we report here, so an empty list is
-            # how "No wake word" survives a reconnect.
+            # how "No wake word" survives a reconnect. Every installed model
+            # is offered, and the ones active on this Echo are named (#112):
+            # HA's two pickers each choose one, and the phrase we send on a
+            # wake says which fired. What is recorded as told is what
+            # update_wake_words compares to decide whether HA must re-read.
             srv = self._owning_server
             enabled = srv is None or srv.wake_word_enabled
+            offer = self._wake_offer()
             if srv is not None:
                 srv.wake_word_told = enabled
+                srv.wake_offer_told = offer
             yield api_pb2.VoiceAssistantConfigurationResponse(
                 available_wake_words=[
                     api_pb2.VoiceAssistantWakeWord(
-                        id=self.oww_model_id,
-                        wake_word=self.oww_model_info.name,
-                        trained_languages=list(self.oww_model_info.languages),
+                        id=a.id,
+                        wake_word=a.name,
+                        trained_languages=list(a.languages),
                     )
+                    for a in offer.advertised
                 ],
-                active_wake_words=[self.oww_model_id] if enabled else [],
-                max_active_wake_words=1,
+                active_wake_words=list(offer.active) if enabled else [],
+                max_active_wake_words=offer.max_active,
             )
             return
 
         if isinstance(msg, api_pb2.VoiceAssistantSetConfiguration):
-            # HA's wake word picker (#286): "No wake word" turns detection
-            # off, our model turns it back on. Applied synchronously because
-            # HA reads the configuration back straight after writing it.
+            # HA's wake word pickers (#286, #112): "No wake word" in both
+            # turns detection off; any of our models turns it on, and the
+            # models chosen become this Echo's wake words. Applied
+            # synchronously because HA reads the configuration back straight
+            # after writing it.
             requested = list(msg.active_wake_words)
-            want = em_wakeword.requested_on(requested, self.oww_model_id)
+            want = em_wakeword.requested_on(requested, self._wake_offer().ids())
             if want is None:
                 log.warning(
                     f"[{self._log_name}] VoiceAssistantSetConfiguration asked "
-                    f"for active_wake_words={requested} — not applied. This "
-                    f"device's wake word is {self.oww_model_id}, set in the "
-                    f"EchoMuse dashboard; choose it to listen, or \"No wake "
-                    f"word\" to stop."
+                    f"for active_wake_words={requested} — not applied. None "
+                    f"of them is installed on this controller; install a "
+                    f"model in the EchoMuse dashboard first."
                 )
             else:
-                log.info(f"[{self._log_name}] wake word {'on' if want else 'off'} from HA")
+                log.info(f"[{self._log_name}] wake word {'on' if want else 'off'} from HA"
+                         + (f": {requested}" if want else ""))
                 self._apply_wake_word(want)
+                if want:
+                    self._apply_wake_models(requested)
             yield _HANDLED
             return
 
@@ -1198,6 +1205,24 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                         f"but device not connected")
             return
         set_fn(on)
+
+    def _apply_wake_models(self, requested: list[str]) -> None:
+        """Hand HA's chosen wake words to the controller, synchronously, so
+        the configuration HA reads back straight after already names them."""
+        set_fn = (self._owning_server._set_wake_models
+                  if self._owning_server is not None else None)
+        if set_fn is None:
+            log.warning(f"[{self._log_name}] wake words chosen but device "
+                        f"not connected")
+            return
+        set_fn(requested)
+
+    def _wake_offer(self) -> em_wake_models.Offer:
+        """The wake words this Echo offers HA, read from the owning server at
+        request time so a change made a moment ago is what HA reads."""
+        srv = self._owning_server
+        offer = getattr(srv, "wake_offer", None) if srv is not None else None
+        return offer if offer is not None else em_wake_models.Offer()
 
     def _announce_play_cb(self):
         """
@@ -2452,15 +2477,17 @@ class DeviceESPhomeServer:
         device_id: str,
         label: str,
         mac_address: str,
-        oww_model_id: str,
         port: int,
-        oww_model_info,
+        wake_offer: em_wake_models.Offer,
     ) -> None:
         self.device_id    = device_id
         self.label        = label
         self.mac_address  = mac_address
-        self.oww_model_id = oww_model_id
-        self.oww_model_info = oww_model_info
+        # The wake words offered to HA and the ones active on this Echo
+        # (#112), and the offer HA last read — None until it asks, and again
+        # once it disconnects, since a fresh connection reads it anew.
+        self.wake_offer   = wake_offer
+        self.wake_offer_told: em_wake_models.Offer | None = None
         self.port         = port
         self._server: Optional[asyncio.AbstractServer] = None
         self._active_satellite: Optional[EchoMuseSatellite] = None
@@ -2483,6 +2510,8 @@ class DeviceESPhomeServer:
         # Injected by device_connected(); applies HA's wake word choice
         # synchronously. None when no device is connected.
         self._set_wake_word = None
+        # Likewise for WHICH wake words HA's pickers chose (#112).
+        self._set_wake_models = None
         # Injected by device_connected() — async callable(pcm_bytes) for
         # standalone announce playback (setup wizard, push TTS) when no
         # voice turn is active.
@@ -2598,8 +2627,6 @@ class DeviceESPhomeServer:
             device_id=self.device_id,
             label=self.label,
             mac_address=self.mac_address,
-            oww_model_id=self.oww_model_id,
-            oww_model_info=self.oww_model_info,
             on_disconnected_cb=self._on_satellite_disconnected,
             owning_server=self,
         )
@@ -2610,6 +2637,7 @@ class DeviceESPhomeServer:
     def _on_satellite_disconnected(self, satellite: EchoMuseSatellite) -> None:
         if self._active_satellite is satellite:
             self._active_satellite = None
+            self.wake_offer_told = None
             log.info(f"[esphome.{self.device_id[-8:]}] HA disconnected")
 
     async def start(self, host: str) -> None:
@@ -2741,12 +2769,14 @@ async def _register_device_server(device_id: str, label: str | None) -> DeviceES
         port = await loop.run_in_executor(None, db.assign_esphome_port, device_id)
         log.info(f"[{device_id}] Allocated ESPHome port {port}")
 
-    # Get OWW model from device config
-    config       = await loop.run_in_executor(None, db.get_device_config, device_id)
-    # Custom models are file paths in config; HA sees the friendly stem.
-    model_name = config.get("owwModel", "hey_jarvis_v0.1")
-    oww_model_id = em_oww_models.prediction_key(model_name)
-    oww_model_info = await loop.run_in_executor(None, em_oww_metadata.resolve, model_name)
+    # The wake words offered to HA, from the effective config and HA's stored
+    # choice. Refreshed when the device connects, which knows its mode.
+    config = await loop.run_in_executor(None, db.get_effective_device_config, device_id)
+    res, _ = await loop.run_in_executor(
+        None, lambda: em_wake_sync.resolve_sync(
+            device_id, config or {}, mode=em_wake_sync.mode_of(None, config or {}),
+            device_max=None))
+    wake_offer = await em_wake_sync.offer_for(res)
 
     # Re-check after the awaits above — a concurrent caller may have
     # created the server while we were in the executor.
@@ -2758,9 +2788,8 @@ async def _register_device_server(device_id: str, label: str | None) -> DeviceES
         device_id=device_id,
         label=label,
         mac_address=mac,
-        oww_model_id=oww_model_id,
-        oww_model_info=oww_model_info,
         port=port,
+        wake_offer=wake_offer,
     )
     # Capabilities that arrived before this server existed decide which HA
     # entities are advertised, and advertising happens once.
@@ -3139,14 +3168,20 @@ async def trigger_voice_turn(
         trigger=trigger_label, t0=time.monotonic(), wake_info=wake_info
     )
 
-    # Only a wake-word turn names a wake word. A button turn genuinely has
+    # Only a turn a wake word started names one. A button turn genuinely has
     # none, and "" is how the protocol says so — aioesphomeapi turns it back
     # into None. Keyed on the trigger label rather than on whether a model is
     # configured, because a model is always configured; what varies is whether
-    # it fired. Covers "wakeword(0.522)" and the on-device "wakeword-dev(…)".
+    # it fired. Covers "wakeword(0.522)", the on-device "wakeword-dev(…)" and
+    # a barge-in, which is a wake word spoken over a reply: with two wake
+    # words it is the phrase that picks the pipeline, so a barge that named
+    # none would always reach the first one's (#112). The name is the one
+    # advertised for the model that FIRED, from the same offer HA's pickers
+    # were built from, so HA's `ww_state.state == wake_word_phrase` matches.
+    offer = server.wake_offer
     wake_word_phrase = (
-        satellite.oww_model_info.name
-        if trigger_label.startswith("wakeword") else ""
+        em_wake_models.phrase((wake_info or {}).get("model"), offer.names(), offer.active)
+        if trigger_label.startswith("wakeword") or trigger_label == "barge-in" else ""
     )
 
     await satellite.run_esphome_voice_turn(
@@ -3218,36 +3253,42 @@ async def push_media_state(device_id: str, state: str) -> None:
         log.debug(f"[{device_id}] media state push failed: {e}")
 
 
-async def update_oww_model(device_id: str, model_id: str) -> None:
-    """
-    Keep HA's wake-word dropdown honest.
+def get_wake_offer(device_id: str) -> "em_wake_models.Offer | None":
+    """The wake words a device's satellite offers HA, None without a server."""
+    server = get_server(device_id)
+    return server.wake_offer if server is not None else None
 
-    The satellite advertises the device's OWW model in
-    VoiceAssistantConfigurationResponse, which HA requests only at connect
-    time — so a wake-word change in the dashboard left HA showing the old
-    model until a controller restart. On a change: store the new id (used
-    by the next satellite instance) and bounce the active HA connection so
-    HA redials (within seconds) and re-requests the configuration.
+
+def set_wake_words_active(device_id: str, active: tuple[str, ...]) -> None:
+    """Record which wake words are active, synchronously — for HA's own
+    choice, which it reads back straight after writing it (#112)."""
+    server = get_server(device_id)
+    if server is not None:
+        server.wake_offer = dataclasses.replace(server.wake_offer, active=tuple(active))
+
+
+async def update_wake_words(device_id: str, offer: "em_wake_models.Offer") -> None:
+    """
+    Keep HA's wake-word pickers honest.
+
+    The satellite offers its wake words in VoiceAssistantConfigurationResponse,
+    which HA requests only when it connects and straight after its own writes
+    — so a change made anywhere else (a dashboard save, an upload, a change of
+    mode that moves the maximum) leaves HA showing the old offer. Stores the
+    new offer, and bounces the HA connection only if what HA last READ is now
+    wrong: HA redials within seconds and reads it again. A change HA made
+    itself was already read back, so it compares equal and nothing bounces.
     """
     server = get_server(device_id)
     if server is None:
         return
-    # Runtime initialization must not pause the audio event loop. A newer
-    # request wins if concurrent model reads complete out of order.
-    revision = getattr(server, "_oww_metadata_revision", 0) + 1
-    server._oww_metadata_revision = revision
-    model_info = await asyncio.to_thread(em_oww_metadata.resolve, model_id)
-    if get_server(device_id) is not server or server._oww_metadata_revision != revision:
-        return
-    model_id = em_oww_models.prediction_key(model_id)
-    if server.oww_model_id == model_id and server.oww_model_info == model_info:
-        return
-    server.oww_model_id = model_id
-    server.oww_model_info = model_info
+    server.wake_offer = offer
+    told = server.wake_offer_told
     satellite = server.get_satellite()
-    if satellite is not None:
-        log.info(f"[{device_id}] OWW model → {model_id} — bouncing HA "
-                 f"connection to refresh the wake word configuration")
+    if satellite is not None and told is not None and told != offer:
+        log.info(f"[{device_id}] wake words → {list(offer.active)} of "
+                 f"{len(offer.advertised)} (max {offer.max_active}) — bouncing "
+                 f"HA connection to refresh the wake word configuration")
         satellite.disconnect()
 
 
@@ -3264,6 +3305,7 @@ async def device_connected(
     start_conversation=None,
     set_wake_word=None,
     wake_word_enabled: bool = True,
+    set_wake_models=None,
 ) -> None:
     """
     Called by em_controller.handle_control() when an Echo Dot connects.
@@ -3294,6 +3336,9 @@ async def device_connected(
     set_wake_word: callable(on: bool) — applies HA's wake word picker (#286)
     synchronously.
 
+    set_wake_models: callable(ids: list[str]) — applies which wake words HA's
+    pickers chose (#112), synchronously.
+
     wake_word_enabled: HA's stored picker choice, set before the port comes
     up so HA's first read is already correct.
     """
@@ -3316,6 +3361,7 @@ async def device_connected(
     server._stop_alarm = stop_alarm
     server._start_conversation = start_conversation
     server._set_wake_word = set_wake_word
+    server._set_wake_models = set_wake_models
     server.wake_word_enabled = bool(wake_word_enabled)
     if server._server is not None:
         log.debug(f"[esphome.{device_id[-8:]}] device_connected: port {server.port} already listening")
@@ -3347,6 +3393,7 @@ async def device_disconnected(device_id: str) -> None:
     server._stop_alarm = None
     server._start_conversation = None
     server._set_wake_word = None
+    server._set_wake_models = None
     await server.stop()
     log.info(f"[esphome.{device_id[-8:]}] ESPHome port {server.port} down (device disconnected)")
 
@@ -3385,7 +3432,7 @@ def set_device_capabilities(device_id: str, caps: list[str]) -> None:
     # restart that happened to win the race (#90).
     #
     # Bouncing the HA connection is the documented way to force a re-read;
-    # update_oww_model does the same thing for the wake word configuration.
+    # update_wake_words does the same thing for the wake word configuration.
     # HA redials within seconds.
     before = set(server.capabilities or [])
     server.set_capabilities(caps)
@@ -3502,7 +3549,7 @@ def update_wake_word(device_id: str, enabled: bool, refresh: bool = False) -> No
     write there is nothing to push: it re-reads the configuration itself.
     `refresh` is for a change HA did not ask for (#776): it reads the state
     only at connect, so the connection is bounced when what it last read is
-    now wrong, as update_oww_model does."""
+    now wrong, as update_wake_words does."""
     server = _servers.get(device_id)
     if server is None:
         return

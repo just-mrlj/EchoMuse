@@ -86,6 +86,8 @@ import em_endpoints
 import em_scenes
 import em_shadow
 import em_support
+import em_wake_models
+import em_wake_sync
 from version import VERSION as CONTROLLER_VERSION
 from version import compare as _compare_versions
 from version import parse as _parse_version
@@ -1334,20 +1336,31 @@ async def _apply_live_config(device_id: str, live, effective: dict) -> None:
     body is partial by design, and a device must always be sent the whole
     resolved picture.
 
+    The firmware is sent ONE wake word, the first this device listens for
+    (em_wake_models.for_device): HA may have chosen a different one from the
+    dashboard's (#112). `effective` itself, the stored values, is what the
+    mirrors read.
+
     One key is held back: a NEW `owwModel` is not sent to a device that scores
     locally until the classifier is actually on it — see _hold_back_oww_model.
     """
     effective = _well_typed(device_id, effective)
-    effective, pending_model = _hold_back_oww_model(live, effective)
-    await live.send_control({"type": "config", **effective})
+    # The incoming mode, since it sets how many wake words this Echo can run.
+    wake_res = await em_wake_sync.resolve(
+        device_id, live, effective,
+        mode=em_shadow.effective_mode(effective.get("owwOnDevice", live.oww_on_device),
+                                      live.oww_trigger_capable))
+    to_send = em_wake_models.for_device(effective, wake_res)
+    to_send, pending_model = _hold_back_oww_model(live, to_send)
+    await live.send_control({"type": "config", **to_send})
     if "owwThreshold" in effective:
         live.oww_threshold = float(effective["owwThreshold"])
     if "owwModel" in effective:
-        live.oww_model = effective["owwModel"]
-        # Refresh HA's wake-word dropdown (lazy import — em_esphome imports
-        # em_api at module level).
-        import em_esphome
-        await em_esphome.update_oww_model(device_id, effective["owwModel"])
+        live.oww_default_model = effective["owwModel"]
+        live.oww_model = to_send["owwModel"]
+    # Refresh HA's wake word pickers — they bounce only if what HA last read
+    # is now wrong.
+    await em_wake_sync.publish(device_id, live, wake_res)
     if pending_model:
         # The device is still on its previous wake word, still scoring
         # locally, still answering. Install, then switch.
@@ -1954,6 +1967,8 @@ async def _post_oww_model_upload(request: web.Request) -> web.Response:
             raise
         log.info(f"[api] Wake model installed: {fname} ({len(data):,} bytes)")
         entry = next((m for m in em_oww_models.scan() if m["file"] == fname), None)
+        # Offered to Home Assistant on every Echo straight away (#112).
+        em_tasks.spawn(em_wake_sync.refresh_all(_devices))
         return _ok({"model": entry}, status=201)
     except Exception as e:
         log.error(f"[api] Model upload error: {e}")
@@ -1979,13 +1994,17 @@ async def _delete_oww_model(request: web.Request) -> web.Response:
     configs: dict[str, dict] = {"global": db.get_global_device_config()}
     for row in db.get_all_devices():
         configs[row["device_id"]] = db.get_device_config(row["device_id"])
-    users = em_oww_models.in_use_by(str(path), configs)
+    users = em_oww_models.in_use_by(str(path), configs,
+                                    db.get_wake_word_overrides())
     if users:
         return _error("model_in_use",
                       f"Model is selected by: {', '.join(users)}", 409)
 
     path.unlink()
     log.info(f"[api] Wake model deleted: {fname}")
+    # Every HA connection offers the installed models (#112), so each one
+    # is told; only those whose offer changed are bounced.
+    em_tasks.spawn(em_wake_sync.refresh_all(_devices))
     return _ok({"deleted": fname})
 
 
@@ -4751,13 +4770,13 @@ def _oww_wanted_models(device_id: str) -> list[str]:
     """
     The models a device should carry, most important first.
 
-    The configured one is pinned and therefore first. Nothing else is added:
-    extra slots exist so that models a user has already installed survive a
-    switch, not so the controller can push models nobody asked for.
+    Its wake words (#112: HA's choice, else the dashboard's model), the first
+    of which the firmware runs and is therefore first. All are pinned. Nothing
+    else is added: extra slots exist so that models a user has already
+    installed survive a switch, not so the controller can push models nobody
+    asked for.
     """
-    cfg = db.get_effective_device_config(device_id) or {}
-    model = (cfg.get("owwModel") or "").strip()
-    return [model] if model else []
+    return em_wake_sync.wanted_models(device_id)
 
 
 def _hold_back_oww_model(live, effective: dict):
@@ -4853,20 +4872,21 @@ async def _install_then_switch(device_id: str, model: str) -> None:
                   f"{result.get('error')} — device left on {live.oww_model}")
         return
 
-    effective = await asyncio.get_event_loop().run_in_executor(
+    effective = _well_typed(device_id, await asyncio.get_event_loop().run_in_executor(
         None, db.get_effective_device_config, device_id
-    )
-    if (effective.get("owwModel") or "").strip() != model:
-        # Changed again while the push was running; that save owns the
-        # outcome and has its own install task.
+    ))
+    wake_res = await em_wake_sync.resolve(device_id, live, effective)
+    to_send = em_wake_models.for_device(effective, wake_res)
+    if (to_send.get("owwModel") or "").strip() != model:
+        # Changed again while the push was running (a save, or Home
+        # Assistant); that change owns the outcome and has its own install task.
         log.info(f"[api] [{device_id}] wake word changed again during install "
                  f"— dropping the switch to {model}")
         return
 
-    await live.send_control({"type": "config", **_well_typed(device_id, effective)})
+    await live.send_control({"type": "config", **to_send})
     live.oww_model = model
-    import em_esphome
-    await em_esphome.update_oww_model(device_id, model)
+    await em_wake_sync.publish(device_id, live, wake_res)
     await _push_log_event(
         device_id, "info", "controller",
         f"Wake word model {model} installed — device switched"
@@ -6538,6 +6558,9 @@ def _merge_device(row, boot: dict | None = None) -> dict:
         "muted":            getattr(live, "muted",     False) if live else False,
         # Stored, not live (#286): an offline device reports HA's last choice.
         "wake_word":        db.get_wake_word_enabled(device_id),
+        # Which wake words, and whether Home Assistant chose them (#112) — the
+        # fleet view must show a device not following the dashboard's model.
+        "wakeWords":        em_wake_sync.view_for(device_id, live),
         "listening":        getattr(live, "listening", False) if live else False,
         "thinking":         getattr(live, "thinking",  False) if live else False,
         "stats":            live.stats if live else None,

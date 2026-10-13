@@ -18,42 +18,53 @@ import em_wakeword
 # ── What a picker write asks for ─────────────────────────────────────────────
 
 MODEL = "hey_mycroft_v0.1"
+# Everything we advertise (#112): every installed model, stock and custom.
+OURS = {MODEL, "hey_jarvis_v0.1", "alexa_v0.1"}
 
 
 def test_no_wake_word_is_off():
-    assert em_wakeword.requested_on([], MODEL) is False
+    assert em_wakeword.requested_on([], OURS) is False
 
 
 def test_our_model_is_on():
-    assert em_wakeword.requested_on([MODEL], MODEL) is True
+    assert em_wakeword.requested_on([MODEL], OURS) is True
 
 
 def test_our_model_from_both_pickers_is_on():
     """HA creates "Wake word" and "Wake word 2" and sends the union of both,
     whatever max_active_wake_words says — so our model can arrive twice."""
-    assert em_wakeword.requested_on([MODEL, MODEL], MODEL) is True
+    assert em_wakeword.requested_on([MODEL, MODEL], OURS) is True
+
+
+def test_any_of_ours_is_on():
+    """Two pickers, two of our wake words: on. WHICH is em_wake_models'."""
+    assert em_wakeword.requested_on([MODEL, "alexa_v0.1"], OURS) is True
+    assert em_wakeword.requested_on(["alexa_v0.1"], OURS) is True
 
 
 def test_our_model_beside_one_we_lack_is_on():
     """Picker 2 set to our model while picker 1 holds something else still
     asks for our wake word."""
-    assert em_wakeword.requested_on(["alexa", MODEL], MODEL) is True
+    assert em_wakeword.requested_on(["alexa", MODEL], OURS) is True
 
 
 def test_only_wake_words_we_lack_is_declined_not_off():
     """Nobody choosing "Alexa" meant "stop listening". HA re-reads straight
     after writing, so declining snaps the picker back to the truth."""
-    assert em_wakeword.requested_on(["alexa"], MODEL) is None
-    assert em_wakeword.requested_on(["alexa", "okay_nabu"], MODEL) is None
+    assert em_wakeword.requested_on(["alexa"], OURS) is None
+    assert em_wakeword.requested_on(["alexa", "okay_nabu"], OURS) is None
 
 
 def test_a_custom_model_is_matched_by_its_id_exactly():
     """Custom models are advertised by prediction key (the filename stem), and
     HA sends back the id it was given — never a path, and never a prefix."""
     custom = "kitchen_helper"
-    assert em_wakeword.requested_on([custom], custom) is True
+    assert em_wakeword.requested_on([custom], {custom}) is True
+    assert em_wakeword.requested_on(["kitchen"], {custom}) is None
+    assert em_wakeword.requested_on(["/data/oww_models/kitchen_helper.onnx"], {custom}) is None
+    # One id passed bare is still one id, not a string to search.
     assert em_wakeword.requested_on(["kitchen"], custom) is None
-    assert em_wakeword.requested_on(["/data/oww_models/kitchen_helper.onnx"], custom) is None
+    assert em_wakeword.requested_on([custom], custom) is True
 
 
 # ── The choice from HA ───────────────────────────────────────────────────────

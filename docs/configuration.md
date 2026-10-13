@@ -278,7 +278,10 @@ automatically the next time they connect.
 **Changing the wake word briefly reconnects the device in Home Assistant.**
 Home Assistant only reads a satellite's wake word configuration when it
 connects, so the controller drops and remakes that connection to make the new
-name show up. It takes a few milliseconds, but during it **every entity for
+name show up. The same happens when you upload or delete a custom model, which
+changes the list every device offers, and when you change where the wake word
+is detected, which changes how many it can listen for. A choice made in Home
+Assistant itself never reconnects anything. It takes a few milliseconds, but during it **every entity for
 that device goes unavailable and comes straight back** — the voice assistant,
 the media player, the action button, the ambient light sensor and the
 Microphone Muted sensor.
@@ -298,8 +301,46 @@ trigger:
       - unknown
 ```
 
-Nothing is wrong with the device when this happens, and it only happens when
-you change the wake word.
+Nothing is wrong with the device when this happens, and it only happens on
+the changes listed above.
+
+### Two wake words, two assistants
+
+Each Echo can listen for two wake words at once, and each one can start a
+different Home Assistant assistant: say "Hey Jarvis" for one agent and "Alexa"
+for another.
+
+Set it up in Home Assistant, on the Echo's device page:
+
+1. **Wake word** and **Assistant** are the first pair. **Wake word 2** and
+   **Assistant 2** are the second.
+2. Pick a wake word in each, and the assistant it should start.
+
+Every model installed on the controller is offered in both lists, custom ones
+included. Upload a model here first if you want to use it there.
+
+Who decides what:
+
+- **The dashboard** decides which models are installed and the default wake
+  word (the tiles above).
+- **Home Assistant** decides which of them each Echo listens for. Its choice
+  replaces the dashboard's wake word for that Echo only. The Status tab shows
+  the words in use and says **chosen in Home Assistant**, and Config → Wake
+  word says which Echoes are not using the model selected there.
+- **To hand an Echo back to the dashboard**, pick the dashboard's wake word in
+  Home Assistant's **Wake word** and set **Wake word 2** to **No wake word**.
+
+How many at once depends on where the wake word is detected:
+
+- **On the controller:** up to four. Home Assistant offers two.
+- **On this Echo:** one on current firmware. Pick a second and Home
+  Assistant's **Wake word 2** goes straight back to **No wake word**, because
+  the Echo listens only for the first. Switching an Echo to detecting its own
+  wake word clears its **Wake word 2** the same way; switching back does not
+  restore it, so pick it again.
+
+Home Assistant does not filter the lists by language. The stock words are
+English models, and they appear and work with an assistant in any language.
 
 ### Arbitration window
 With more than one Echo, saying the wake word in earshot of two of them

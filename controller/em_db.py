@@ -1966,6 +1966,89 @@ def set_wake_word_enabled(device_id: str, enabled: bool) -> None:
         )
 
 
+# The wake words HA's two pickers chose per device (#112), {device_id: [ids]}.
+# Absent means the device follows the dashboard's owwModel. Kept out of device
+# config for _WAKE_WORD_OFF_KEY's reason. One blob for every device, so every
+# write is a read-modify-write in one tx — and goes through em_dbwriter, so two
+# Echoes changing at once are applied in order and neither write is lost.
+_WAKE_WORDS_HA_KEY = "wake_words_ha"
+# Display names HA has been given, {model_id: {"base", "name"}}; assign-once,
+# see em_wake_models.assign_names.
+_WAKE_WORD_NAMES_KEY = "wake_word_names"
+
+
+def _json_dict(conn: sqlite3.Connection, key: str) -> dict:
+    row = conn.execute(
+        "SELECT value FROM system_config WHERE key = ?", (key,)
+    ).fetchone()
+    if row is None or not row["value"]:
+        return {}
+    try:
+        value = json.loads(row["value"])
+    except (json.JSONDecodeError, TypeError):
+        log.warning(f"[db] Invalid {key} JSON — ignoring it")
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _wake_words_ha(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    out = {}
+    for device_id, ids in _json_dict(conn, _WAKE_WORDS_HA_KEY).items():
+        if isinstance(ids, list):
+            ids = [i for i in ids if isinstance(i, str)]
+            if ids:
+                out[device_id] = ids
+    return out
+
+
+def get_wake_word_override(device_id: str) -> list[str] | None:
+    """The wake words HA chose for this device, or None to follow the dashboard."""
+    assert _conn is not None, "db.init() has not been called"
+    with _db_lock:
+        return _wake_words_ha(_conn).get(device_id)
+
+
+def get_wake_word_overrides() -> dict[str, list[str]]:
+    """Every device's HA wake word choice, for the fleet view and model deletes."""
+    assert _conn is not None, "db.init() has not been called"
+    with _db_lock:
+        return _wake_words_ha(_conn)
+
+
+def set_wake_word_override(device_id: str, ids: list[str] | None) -> None:
+    """Record HA's wake word choice for one device; None or [] clears it."""
+    with _tx() as conn:
+        all_ids = _wake_words_ha(conn)
+        if ids:
+            all_ids[device_id] = list(ids)
+        else:
+            all_ids.pop(device_id, None)
+        conn.execute(
+            "INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)",
+            (_WAKE_WORDS_HA_KEY, json.dumps(all_ids, sort_keys=True)),
+        )
+
+
+def assign_wake_word_names(candidates: list[tuple[str, str]]) -> dict[str, str]:
+    """
+    Stable display names for the installed wake words, {id: name}.
+
+    `candidates` is [(id, base phrase)], stock models first. The registry is
+    read, extended and written in one tx (em_wake_models.assign_names), and
+    only written when it changed.
+    """
+    import em_wake_models
+    with _tx() as conn:
+        before = _json_dict(conn, _WAKE_WORD_NAMES_KEY)
+        names, after = em_wake_models.assign_names(before, candidates)
+        if after != before:
+            conn.execute(
+                "INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)",
+                (_WAKE_WORD_NAMES_KEY, json.dumps(after, sort_keys=True)),
+            )
+        return names
+
+
 def get_global_device_config() -> dict:
     """
     Return the fleet-wide default device config.
@@ -2175,8 +2258,10 @@ def delete_device(device_id: str) -> None:
         conn.execute("DELETE FROM device_boots WHERE device_id = ?", (device_id,))
         conn.execute("DELETE FROM device_wear WHERE device_id = ?", (device_id,))
         conn.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
-    # A re-added device is new to HA, so it starts listening.
+    # A re-added device is new to HA, so it starts listening, for the
+    # dashboard's wake word.
     set_wake_word_enabled(device_id, True)
+    set_wake_word_override(device_id, None)
     try:
         removed = em_recordings.delete_device(device_id)
         if removed:

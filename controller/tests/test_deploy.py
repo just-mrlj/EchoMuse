@@ -1343,6 +1343,10 @@ def test_wake_word_phrase_is_sent_and_matches_what_we_advertise():
     phrase and the advertised name must come from ONE function or they drift
     apart and HA silently matches neither.
 
+    Since #112 there are several wake words, and the phrase is the name of the
+    one that FIRED. Names and phrase both come from the server's one
+    `wake_offer`, built by em_wake_sync from em_wake_models.assign_names.
+
     Source-shape assertions: this suite does not import em_esphome, which
     needs aiohttp and the protobufs.
     """
@@ -1356,13 +1360,20 @@ def test_wake_word_phrase_is_sent_and_matches_what_we_advertise():
 
     advertised = re.search(r"api_pb2\.VoiceAssistantWakeWord\((.*?)\)", src, re.S)
     assert advertised, "VoiceAssistantWakeWord advertisement not found"
-    assert "self.oww_model_info.name" in advertised.group(1), (
-        "the advertised wake_word must come from the connection metadata, "
-        "the same source as the phrase we send")
+    assert "wake_word=a.name" in advertised.group(1), (
+        "the advertised wake_word must come from the offer's names, the same "
+        "source as the phrase we send")
+    config = src[src.index("isinstance(msg, api_pb2.VoiceAssistantConfigurationRequest)"):]
+    assert "offer = self._wake_offer()" in config[:config.index("yield")]
 
-    assert 'satellite.oww_model_info.name' in src, (
-        "the phrase must use the same connection metadata — a second spelling "
-        "is how it drifts from what we advertised")
+    turn = src[src.index("async def trigger_voice_turn("):]
+    turn = turn[:turn.index("\nasync def ") if "\nasync def " in turn else None]
+    assert "offer = server.wake_offer" in turn and "offer.names()" in turn, (
+        "the phrase must use the same offer's names — a second spelling is "
+        "how it drifts from what we advertised")
+    assert 'em_wake_models.phrase((wake_info or {}).get("model")' in turn, (
+        "the phrase must name the wake word that fired, or HA routes every "
+        "wake word to the first pipeline")
 
 
 def test_button_turns_claim_no_wake_word():
@@ -1378,6 +1389,10 @@ def test_button_turns_claim_no_wake_word():
     assert 'trigger_label.startswith("wakeword")' in gate.group(1), (
         "the phrase must be gated on the trigger being a wake word, so button "
         "turns send \"\"")
+    # A barge-in is a wake word spoken over a reply; with two wake words its
+    # phrase is what picks the pipeline (#112). Still nothing for a button.
+    assert 'trigger_label == "barge-in"' in gate.group(1)
+    assert "button" not in gate.group(1)
 
 
 def test_a_run_ha_never_started_ends_the_turn():
@@ -1513,7 +1528,7 @@ def test_a_new_wake_word_is_installed_before_the_device_is_told_about_it():
     assert fn, "_apply_live_config not found"
     body = fn.group(0)
 
-    hold = body.find("_hold_back_oww_model(live, effective)")
+    hold = body.find("_hold_back_oww_model(live, to_send)")
     push = body.find('send_control({"type": "config"')
     assert hold != -1, "the new model is no longer held back"
     assert push != -1, "the config push is gone"

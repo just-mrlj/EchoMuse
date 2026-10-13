@@ -30,8 +30,7 @@ from esphome.vendor.api_pb2 import VoiceAssistantEvent as ET  # noqa: E402
 def satellite() -> "em_esphome.EchoMuseSatellite":
     s = em_esphome.EchoMuseSatellite(
         device_id="G090LF0000000001", label="Test", mac_address="02:EC:00:00:00:01",
-        oww_model_id="hey_jarvis_v0.1", on_disconnected_cb=lambda *_: None,
-        oww_model_info=None)
+        on_disconnected_cb=lambda *_: None)
     s._turn_active = True
     return s
 

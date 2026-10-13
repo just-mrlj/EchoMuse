@@ -131,12 +131,17 @@ def scan(directory: Path | None = None) -> list[dict]:
     return out
 
 
-def in_use_by(model_path: str, configs: dict[str, dict]) -> list[str]:
+def in_use_by(model_path: str, configs: dict[str, dict],
+              ha_choices: dict[str, list[str]] | None = None) -> list[str]:
     """
     Which config scopes reference this model path? `configs` maps a
     scope label (device id, or "global") to its config dict. Compares
     resolved paths so `/app/data/oww_models/x.onnx` and a symlinked
     spelling of the same file both match.
+
+    `ha_choices` is the wake words Home Assistant chose per device (#112),
+    by prediction key; a device listening for this model because HA picked
+    it is a user too, reported as "<device> (Home Assistant)".
     """
     target = str(Path(model_path).resolve())
     users = []
@@ -146,4 +151,8 @@ def in_use_by(model_path: str, configs: dict[str, dict]) -> list[str]:
             continue  # stock model name, not a file path
         if str(Path(ref).resolve()) == target:
             users.append(scope)
+    key = prediction_key(model_path)
+    for device_id, ids in (ha_choices or {}).items():
+        if key in ids:
+            users.append(f"{device_id} (Home Assistant)")
     return users

@@ -79,12 +79,18 @@ def test_the_wake_word_defaults_to_listening():
 
 
 def test_the_picker_reads_back_the_truth():
-    """HA's picker shows what we report, so it must never report the model while off."""
+    """HA's picker shows what we report, so it must never report a model while
+    off. Since #112 every installed model is offered, the active ones are
+    named, and the maximum is this Echo's own."""
     src = ESPHOME.read_text()
     cfg = _block(src, "isinstance(msg, api_pb2.VoiceAssistantConfigurationRequest)",
                  "\n        if isinstance(msg, ")
-    assert "active_wake_words=[self.oww_model_id] if enabled else []" in cfg
+    assert "active_wake_words=list(offer.active) if enabled else []" in cfg
+    assert "for a in offer.advertised" in cfg
+    assert "max_active_wake_words=offer.max_active" in cfg
     assert "wake_word_enabled" in cfg
+    # What HA read is recorded, so a later change knows to bounce it.
+    assert "srv.wake_offer_told = offer" in cfg
 
 
 def test_the_picker_turns_detection_on_and_off():
@@ -92,9 +98,12 @@ def test_the_picker_turns_detection_on_and_off():
     src = ESPHOME.read_text()
     setcfg = _block(src, "isinstance(msg, api_pb2.VoiceAssistantSetConfiguration)",
                     "\n        if isinstance(msg, ")
-    assert "em_wakeword.requested_on(requested, self.oww_model_id)" in setcfg
+    assert "em_wakeword.requested_on(requested, self._wake_offer().ids())" in setcfg
     assert "if want is None:" in setcfg
     assert "self._apply_wake_word(want)" in setcfg
+    # WHICH wake words (#112), only when turning on: "No wake word" is [].
+    on = setcfg[setcfg.index("if want:"):]
+    assert "self._apply_wake_models(requested)" in on
 
 
 def test_the_picker_write_is_applied_before_the_handler_yields():
@@ -113,6 +122,17 @@ def test_the_picker_write_is_applied_before_the_handler_yields():
     for line in ("_d.wake_word_enabled = t.enabled",
                  "esphome.update_wake_word(_d.device_id, t.enabled)",
                  "em_dbwriter.submit(db.set_wake_word_enabled, _d.device_id, t.enabled)"):
+        assert line in setter, f"{line!r} must run before the setter returns"
+    assert "await " not in setter
+
+    # The same for WHICH wake words HA chose (#112).
+    apply = _block(src, "    def _apply_wake_models(self, requested: list[str]) -> None:", "\n    def ")
+    assert re.search(r"^\s+set_fn\(requested\)\s*$", apply, re.M), "called, not scheduled"
+    setter = _block(ctrl, "        def _set_wake_models(requested: list[str], _d=_device_ref) -> None:",
+                    "            async def _follow()")
+    for line in ("_d.wake_resolution = res",
+                 "esphome.set_wake_words_active(_d.device_id, res.active)",
+                 "em_dbwriter.submit(db.set_wake_word_override, _d.device_id,"):
         assert line in setter, f"{line!r} must run before the setter returns"
     assert "await " not in setter
 

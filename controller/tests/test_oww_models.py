@@ -53,7 +53,9 @@ def test_every_score_the_controller_reads_is_made_scalar():
     src = (Path(__file__).resolve().parent.parent / "em_controller.py").read_text()
     reads = [l.strip() for l in src.splitlines() if "prediction.get(" in l]
     assert len(reads) >= 2
-    assert all(l.startswith("score = em_oww_models.scalar_score(prediction.get(")
+    # One score per wake word since #112, each made scalar the same way.
+    assert all(l.startswith(("score = em_oww_models.scalar_score(prediction.get(",
+                             "scores = {k: em_oww_models.scalar_score(prediction.get("))
                for l in reads), reads
 
 

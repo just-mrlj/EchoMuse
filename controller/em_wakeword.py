@@ -33,18 +33,22 @@ class Transition(NamedTuple):
     changed: bool
 
 
-def requested_on(requested: list[str], model_id: str) -> bool | None:
+def requested_on(requested: list[str], available) -> bool | None:
     """
     What a VoiceAssistantSetConfiguration asks for: True for on, False for
     off, None to decline.
 
-    Read by membership because HA sends the union of its two pickers ("Wake
-    word" and "Wake word 2"). A list naming only wake words we don't have is
-    declined rather than read as off; HA's re-read snaps the picker back.
+    `available` is the set of wake word ids we advertise. HA sends the union
+    of its two pickers ("Wake word" and "Wake word 2"), so any one of ours
+    means on; WHICH ones is em_wake_models'. A list naming only wake words we
+    don't have is declined rather than read as off; HA's re-read snaps the
+    picker back.
     """
     if not requested:
         return False
-    if model_id in requested:
+    if isinstance(available, str):
+        available = {available}  # one id, never a substring test
+    if any(r in available for r in requested):
         return True
     return None
 

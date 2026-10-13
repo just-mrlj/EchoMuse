@@ -2197,7 +2197,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
             const stoText  = s?.storageTotalMb != null
               ? `${(s.storageUsedMb/1024).toFixed(1)} / ${(s.storageTotalMb/1024).toFixed(1)} GB` : null;
             const cfgEff = effectiveConfig(globalConfig, device);
-            const wwLabel = wwModelLabel(cfgEff.owwModel);
+            const wwRow = _wakeWordsRow(device, cfgEff);
             return (
               <div style={{ minHeight:'100%', display:'flex', flexDirection:'column', gap:16 }}>
                 <div className="em-grid2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 }}>
@@ -2269,6 +2269,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                            ? [device.health.bootReason?.text, relTime(device.health.bootAt)].filter(Boolean).join(' · ')
                            : '—',
                          _levelColor(device.health?.bootReason?.level))}
+                    {row('Wake word', <span title={wwRow.title || undefined}>{wwRow.label}</span>, wwRow.color)}
                     {row('Config', (() => {
                       const n = (device.config_sections ?? []).length;
                       const total = Object.keys(CONFIG_SECTIONS).length;
@@ -2396,10 +2397,14 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
               useful, was cramped at the bottom of Status). */}
           {tab === 'activity' && (() => {
             const cfgEff = effectiveConfig(globalConfig, device);
-            const wwLabel = wwModelLabel(cfgEff.owwModel);
+            // Every wake word this Echo listens for (#112); a controller
+            // without wakeWords reads the configured model.
+            const wwLabel = `${device.wakeWords?.active?.length
+              ? device.wakeWords.active.map(a => a.name).join(' + ')
+              : wwModelLabel(cfgEff.owwModel)} @ ${cfgEff.owwThreshold != null ? cfgEff.owwThreshold.toFixed(2) : '—'}`;
             return (
               <div style={{ minHeight:'100%', display:'flex', flexDirection:'column' }}>
-                <Panel label={`Voice activity — ${wwLabel} @ ${cfgEff.owwThreshold != null ? cfgEff.owwThreshold.toFixed(2) : '—'}`} style={{ flex:1 }}>
+                <Panel label={`Voice activity — ${wwLabel}`} style={{ flex:1 }}>
                   <TurnObservability
                     turns={turns}
                     deviceId={device.device_id}
@@ -2474,6 +2479,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                   ? <SendspinPairing deviceId={device.device_id} status={device.sendspin} isAdmin={isAdmin}/>
                   : null}
                 bleConnectCapable={!device.connected || !!device.bleConnectCapable}
+                wakeWords={device.wakeWords}
                 blePanel={device.connected && device.bleConnectCapable
                   ? <BleProxyKey deviceId={device.device_id} status={device.bleProxy} isAdmin={isAdmin}/>
                   : null}
@@ -3307,6 +3313,44 @@ function _baseOsLabel(baseOs) {
 // older controller has never heard of the field, so it keeps today's reading
 // rather than claiming "no token" on every device at once — the same
 // NULL-not-zero rule the rest of this file lives by.
+// The Status tab's Wake word row (#112): every wake word this Echo listens for,
+// and whether Home Assistant chose them rather than the dashboard. Home
+// Assistant's two wake word pickers can choose per Echo, apart from the fleet's
+// model, and a row that showed only the configured model would say one thing
+// while the Echo did another. `wakeWords` is em_wake_models.view; a controller
+// that predates it sends none, and the row reads the configured model as before.
+function _wakeWordsRow(device, cfgEff) {
+  if (device.wake_word === false) {
+    return { label: 'Off (Home Assistant)', color: 'var(--muted)',
+             title: '"No wake word" is chosen for this Echo in Home Assistant.' };
+  }
+  const ww = device.wakeWords;
+  if (!ww || !Array.isArray(ww.active) || !ww.active.length) {
+    return { label: wwModelLabel(cfgEff?.owwModel), color: null, title: null };
+  }
+  const dropped = Array.isArray(ww.dropped) ? ww.dropped : [];
+  const why = d => d.reason === 'over_max'
+    ? `not applied: this Echo listens for ${ww.max} at once`
+    : 'not applied: no longer installed';
+  const parts = [ww.active.map(a => a.name).join(' + ')];
+  if (ww.source === 'ha') parts.push('chosen in Home Assistant');
+  if (dropped.length) parts.push(`${dropped.length} not applied`);
+  return {
+    label: parts.join(' · '),
+    color: dropped.length ? 'var(--warn)' : null,
+    title: dropped.map(d => `${d.name}: ${why(d)}`).join('\n') || null,
+  };
+}
+
+// Echoes whose wake words Home Assistant chose (#112), for the fleet view: a
+// fleet wake word those Echoes are not using has to say so.
+function _haWakeWordDevices(devices) {
+  return (devices || [])
+    .filter(d => d.wakeWords?.source === 'ha')
+    .map(d => ({ label: d.label || d.device_id,
+                 names: (d.wakeWords.active || []).map(a => a.name).join(' + ') }));
+}
+
 function _linkRow(device) {
   if (!device.connected) {
     return device.linkRefused
@@ -9625,7 +9669,8 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                             responseLevelCapable = true,
                             wakeMicCapable = true,
                             sendspinCapable = true, sendspinPanel = null,
-                            bleConnectCapable = true, blePanel = null }) {
+                            bleConnectCapable = true, blePanel = null,
+                            wakeWords = null, haWakeWordDevices = null }) {
   // emosFleet defaults TRUE for the same reason the capability props above do,
   // and for one more: it gates the console password, which is emOS-only, and
   // disabling a setting because we do not KNOW the fleet has an emOS device
@@ -9937,6 +9982,25 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         chips={<ScopeChip tone="controller">Controller</ScopeChip>}
         desc="openwakeword scores the continuous mic stream on the controller. Sensitivity sets the detection threshold — attempts that score close but miss are counted as near-misses (Status tab)."
         scope={scopeEl('wakeword')} dim={secStyle('wakeword')}>
+        {/* Home Assistant's pickers choose which wake words an Echo listens
+            for (#112). Shown wherever that differs from the model below, so
+            the dashboard never claims an Echo is doing something it is not. */}
+        {wakeWords?.source === 'ha' && (
+          <div className="em-label" style={{ marginBottom: 14, padding: '8px 10px', borderRadius: 8,
+            border: '1px solid var(--border-soft)', background: 'var(--raised)', color: 'var(--text2)' }}>
+            Home Assistant has chosen {(wakeWords.active || []).map(a => a.name).join(' + ')} for
+            this Echo. The model below applies when Home Assistant has not chosen; pick it
+            alone in Home Assistant to return to it.
+          </div>
+        )}
+        {haWakeWordDevices?.length > 0 && (
+          <div className="em-label" style={{ marginBottom: 14, padding: '8px 10px', borderRadius: 8,
+            border: '1px solid var(--border-soft)', background: 'var(--raised)', color: 'var(--text2)' }}>
+            {haWakeWordDevices.length === 1 ? '1 Echo uses' : `${haWakeWordDevices.length} Echoes use`} wake
+            words chosen in Home Assistant, not the model below:{' '}
+            {haWakeWordDevices.map(d => `${d.label} (${d.names})`).join(', ')}.
+          </div>
+        )}
         <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24, alignItems: 'start' }}>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, ...inputStyle }}>
             {WW_MODELS.map(m => (
@@ -10616,7 +10680,7 @@ function DeployAllModal({ release, devices, deployState, onStarted, onDismiss, o
 // Gear icon → modal with two tabs: Fleet Config and Account.
 
 function SettingsPanel({ globalConfig, onGlobalConfigChange, onClose, username, isAdmin,
-                        emosFleet = true }) {
+                        emosFleet = true, haWakeWordDevices = null }) {
   const [tab, setTab]             = useState('fleet');
   const [config, setConfig]       = useState({ ...globalConfig });
   const [dirty, setDirty]         = useState(false);
@@ -10811,7 +10875,7 @@ function SettingsPanel({ globalConfig, onGlobalConfigChange, onClose, username, 
                 Default config applied to all devices unless overridden per-device.
               </div>
               <DeviceConfigForm config={config} onChange={setConf} disabled={false}
-                emosFleet={emosFleet}/>
+                emosFleet={emosFleet} haWakeWordDevices={haWakeWordDevices}/>
               {dirty && (
                 <div style={{ display:'flex', gap:10, marginTop:24 }}>
                   <Pill accent disabled={saving} onClick={saveGlobalConfig}>{saving ? 'Saving…' : 'Save & push to fleet'}</Pill>
@@ -11521,6 +11585,7 @@ function App() {
              said, which is not the same answer — see em_db.fleet_base_os. */
           emosFleet={!status?.fleet_base_os?.length
                      || status.fleet_base_os.includes('emos')}
+          haWakeWordDevices={_haWakeWordDevices(devices)}
           onClose={() => setShowSettings(false)}
           username={role}
           isAdmin={isAdmin}

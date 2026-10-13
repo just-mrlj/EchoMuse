@@ -108,6 +108,8 @@ import em_tap_burst
 import em_esphome as esphome
 import em_ble_proxy
 import em_oww_models
+import em_wake_models
+import em_wake_sync
 import em_player
 import em_volume
 import em_speechgate
@@ -531,7 +533,22 @@ class Device:
         # caching a snapshot at startup, so config changes take effect
         # without requiring a device reconnect.
         self.oww_threshold: float = OWW_THRESHOLD
+        # The model the FIRMWARE has been told (`owwModel` as pushed) — the
+        # first wake word, since firmware runs one. The controller scores all
+        # of `oww_models`.
         self.oww_model:     str   = f"{OWW_MODEL}_v0.1"
+        # Multiple wake words (#112, em_wake_models). `oww_default_model` is
+        # the dashboard's owwModel; `oww_models` the owwModel values of every
+        # wake word active on this Echo, in HA's order. `wake_resolution` is
+        # why (for the dashboard) and `wake_installed` what HA's picker
+        # callback resolves against without touching disk.
+        self.oww_default_model: str = self.oww_model
+        self.oww_models: tuple[str, ...] = (self.oww_model,)
+        self.wake_resolution = None
+        self.wake_installed: dict[str, str] = {}
+        # How many wake words the firmware scores at once when it detects
+        # its own; None (absent) is one.
+        self.oww_max_models: int | None = None
         # Multi-device wake arbitration window (ms, 0 = off). Only
         # consulted when 2+ devices are connected — a solo fleet never
         # pays the latency.
@@ -1513,8 +1530,12 @@ async def _send_gatt(device_id: str, payload: bytes) -> bool:
 # The wake listener and the barge watcher get SEPARATE slots: they build the
 # model differently (the wake listener with enable_speex_noise_suppression, the
 # barge watcher without) and can be live at once, so they must not share one.
-_oww_models:       dict[str, tuple[str, bool, "OWWModel"]] = {}   # id -> (name, speex, model)
-_oww_barge_models: dict[str, tuple[str, "OWWModel"]]       = {}   # id -> (name, model)
+#
+# The variant is the TUPLE of wake word models (#112): one OWWModel scores them
+# all, sharing its preprocessor and embedding, so a change to the set replaces
+# the entry exactly as a change of wake word always did.
+_oww_models:       dict[str, tuple[tuple[str, ...], bool, "OWWModel"]] = {}   # id -> (names, speex, model)
+_oww_barge_models: dict[str, tuple[tuple[str, ...], "OWWModel"]]       = {}   # id -> (names, model)
 
 
 def _forget_oww_models(device_id: str) -> None:
@@ -1539,7 +1560,7 @@ def _reset_wake_model(model) -> "asyncio.Future":
     return asyncio.get_event_loop().run_in_executor(None, model.reset)
 
 
-async def _acquire_wake_model(device: "Device", name: str, speex: bool):
+async def _acquire_wake_model(device: "Device", names: tuple[str, ...], speex: bool):
     """Return the device's wake model, reusing the cached one when the wake word
     and speex setting are unchanged, else building a fresh one and replacing any
     previous entry for this device (#512).
@@ -1549,35 +1570,37 @@ async def _acquire_wake_model(device: "Device", name: str, speex: bool):
     is NOT reset. Either way the caller's WarmupGate stays un-warmed, which is
     correct for both."""
     loop = asyncio.get_event_loop()
+    names = tuple(names)
     cached = _oww_models.get(device.device_id)
-    if cached is not None and cached[0] == name and cached[1] == speex:
+    if cached is not None and cached[0] == names and cached[1] == speex:
         model = cached[2]
         await _reset_wake_model(model)
         return model
     model = await loop.run_in_executor(
         None,
         lambda: OWWModel(
-            wakeword_models=[name],
+            wakeword_models=list(names),
             enable_speex_noise_suppression=speex,
         ),
     )
-    _oww_models[device.device_id] = (name, speex, model)
+    _oww_models[device.device_id] = (names, speex, model)
     return model
 
 
-async def _acquire_barge_model(device: "Device", name: str):
+async def _acquire_barge_model(device: "Device", names: tuple[str, ...]):
     """Return the device's barge-in model, reusing the cached one when the wake
     word is unchanged, else building a fresh one and replacing any previous
     entry (#512). The barge watcher resets the model itself after acquiring it,
     so no reset here. The barge watcher is gated by voice_lock (one turn per
     device), so two barge watchers never score one model concurrently."""
+    names = tuple(names)
     cached = _oww_barge_models.get(device.device_id)
-    if cached is not None and cached[0] == name:
+    if cached is not None and cached[0] == names:
         return cached[1]
     model = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: OWWModel(wakeword_models=[name])
+        None, lambda: OWWModel(wakeword_models=list(names))
     )
-    _oww_barge_models[device.device_id] = (name, model)
+    _oww_barge_models[device.device_id] = (names, model)
     return model
 
 # Peak event-loop lag observed since start, in ms (see
@@ -1797,11 +1820,13 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
     loop = asyncio.get_event_loop()
     # Reused across reconnects via the module cache (#512): a new Device is
     # created per connection, so caching on the Device rebuilt this every time.
-    name = device.oww_model
-    model = await _acquire_barge_model(device, name)
-    # name is the raw owwModel value; scoring needs the openwakeword prediction
-    # key (path → stem).
-    barge_pred_key = em_oww_models.prediction_key(name)
+    names = tuple(device.oww_models)
+    model = await _acquire_barge_model(device, names)
+    # names are raw owwModel values; scoring needs the openwakeword prediction
+    # keys (path → stem). Every wake word this Echo listens for can barge in,
+    # and the one that did names the interrupting turn's pipeline (#112).
+    barge_pred_keys = tuple(em_oww_models.prediction_key(n) for n in names)
+    wake_thresholds = em_wake_models.bars(barge_pred_keys, device.oww_threshold)
     await _reset_wake_model(model)
     # reset() seeds the classifier's window with embeddings of random noise,
     # so the first FEATURE_WINDOW chunks score that noise as much as the room.
@@ -1828,7 +1853,9 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
     # threshold (~0.10) is both safe and necessary. Thinking phase uses the
     # normal wake threshold (see docstring).
     threshold = device.barge_threshold  # refined per-frame by phase below
-    prev_score = 0.0  # previous frame's score — both phases need two
+    # Previous frame's score per wake word — both phases need two
+    # (em_barge.decide_many).
+    prev_scores: dict[str, float] = {}
     prev_heard = None  # when that frame was captured, to date a two-frame barge
     buf = bytearray()
     # Observability: the watcher used to log only on detection, which made a
@@ -1850,7 +1877,7 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
             payload = await device.voice_queue.get()
             if payload is None or isinstance(payload, str):
                 buf.clear()
-                prev_score = 0.0  # sentinel = stream discontinuity; frames
+                prev_scores = {}  # sentinel = stream discontinuity; frames
                 # across it are not consecutive for either two-frame rule
                 prev_heard = None
                 levels.clear()
@@ -1866,7 +1893,8 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
                 rms_max  = max(rms_max, rms)
                 levels.push(rms)
                 prediction = await loop.run_in_executor(None, model.predict, samples)
-                score = em_oww_models.scalar_score(prediction.get(barge_pred_key, 0.0))
+                scores = {k: em_oww_models.scalar_score(prediction.get(k, 0.0))
+                          for k in barge_pred_keys}
                 frames += 1
                 trusted = warmup.feed()
                 in_playback = playback_started.is_set()
@@ -1875,15 +1903,17 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
                 # at a bar ten times lower than the wake threshold, while
                 # scoring the device's own speech, and cut long responses off
                 # mid-sentence (measured 2026-08-20).
-                threshold = (device.barge_threshold if in_playback
-                             else device.oww_threshold)
-                fired, fire_note = em_barge.decide(
-                    score=score,
-                    prev_score=prev_score,
+                # Each wake word on its own two frames (#112). With one model
+                # this is decide().
+                many = em_barge.decide_many(
+                    scores=scores,
+                    prev_scores=prev_scores,
                     in_playback=in_playback,
                     barge_threshold=device.barge_threshold,
-                    wake_threshold=device.oww_threshold,
+                    wake_thresholds=wake_thresholds,
                 )
+                fired, fire_note = many.fired, many.note
+                barge_key, score, threshold = many.model, many.score, many.threshold
                 if fired and not trusted:
                     log.info(
                         f"[{device.device_id}] Barge watcher: {fire_note} "
@@ -1904,7 +1934,7 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
                 # utterance was heard at the first.
                 fired_heard = (prev_heard if in_playback and prev_heard is not None
                                else heard)
-                prev_score = score
+                prev_scores = scores
                 prev_heard = heard
                 if score > peak:
                     peak = score
@@ -1987,7 +2017,7 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
                     # the no_ha branch below, which carries this one off
                     # instead.
                     device.last_wake = {
-                        "model":       barge_pred_key,
+                        "model":       barge_key,
                         "score":       round(float(score), 4),
                         "threshold":   float(threshold),
                         "noise_floor": round(device.noise_floor, 5),
@@ -3524,19 +3554,19 @@ async def _private_barge(device: Device, ev: dict) -> None:
 async def _stream_listen(device: Device):
     loop = asyncio.get_event_loop()
 
-    current_model_name = device.oww_model
-    current_speex_ns    = device.oww_speex_ns
+    current_models   = tuple(device.oww_models)
+    current_speex_ns = device.oww_speex_ns
     log.info(
-        f"[{device.device_id}] OWW: loading model {current_model_name} "
+        f"[{device.device_id}] OWW: loading {', '.join(current_models)} "
         f"(speex_ns={current_speex_ns})"
     )
     # Reused across reconnects via the module cache (#512): a fresh Device is
     # created per connection, so building on the Device leaked a model per
     # reconnect. A cache hit is reset() to match a fresh build.
-    model = await _acquire_wake_model(device, current_model_name, current_speex_ns)
+    model = await _acquire_wake_model(device, current_models, current_speex_ns)
     # NB: for custom models owwModel is a file path but openwakeword keys
     # the prediction dict by the filename stem — never score by the raw name.
-    model_key = em_oww_models.prediction_key(current_model_name)
+    model_keys = tuple(em_oww_models.prediction_key(m) for m in current_models)
 
     log.info(f"[{device.device_id}] OWW: starting (initial threshold={device.oww_threshold:.3f})")
     await device.mic_start()
@@ -3567,35 +3597,35 @@ async def _stream_listen(device: Device):
             if device.private_listening:
                 # The Echo now listens privately; wake_word_listener switches.
                 return
-            if device.oww_model != current_model_name or device.oww_speex_ns != current_speex_ns:
-                new_name  = device.oww_model
-                new_speex = device.oww_speex_ns
+            if tuple(device.oww_models) != current_models or device.oww_speex_ns != current_speex_ns:
+                new_models = tuple(device.oww_models)
+                new_speex  = device.oww_speex_ns
                 log.info(
-                    f"[{device.device_id}] OWW: reloading model "
-                    f"{current_model_name} → {new_name} "
+                    f"[{device.device_id}] OWW: reloading "
+                    f"{', '.join(current_models)} → {', '.join(new_models)} "
                     f"(speex_ns {current_speex_ns} → {new_speex})"
                 )
                 try:
                     # Replaces this device's cached model (dropping the old
                     # one), so a changed wake word does not accumulate models.
                     new_model = await _acquire_wake_model(
-                        device, new_name, new_speex
+                        device, new_models, new_speex
                     )
-                    model             = new_model
-                    model_key         = em_oww_models.prediction_key(new_name)
-                    current_model_name = new_name
-                    current_speex_ns  = new_speex
+                    model            = new_model
+                    model_keys       = tuple(em_oww_models.prediction_key(m) for m in new_models)
+                    current_models   = new_models
+                    current_speex_ns = new_speex
                     buf.clear()
                     # A new model is noise-seeded exactly like a reset one.
                     warmup.reset()
-                    log.info(f"[{device.device_id}] OWW: model reloaded → {new_name} (speex_ns={new_speex})")
+                    log.info(f"[{device.device_id}] OWW: reloaded → {', '.join(new_models)} (speex_ns={new_speex})")
                 except Exception as e:
                     log.error(
-                        f"[{device.device_id}] OWW: failed to load {new_name} "
+                        f"[{device.device_id}] OWW: failed to load {', '.join(new_models)} "
                         f"(speex_ns={new_speex}): {e} "
-                        f"— reverting to {current_model_name} (speex_ns={current_speex_ns})"
+                        f"— reverting to {', '.join(current_models)} (speex_ns={current_speex_ns})"
                     )
-                    device.oww_model     = current_model_name
+                    device.oww_models    = current_models
                     device.oww_speex_ns  = current_speex_ns
             try:
                 payload = await asyncio.wait_for(
@@ -3782,7 +3812,8 @@ async def _stream_listen(device: Device):
                 prediction = await loop.run_in_executor(
                     None, model.predict, samples
                 )
-                score = em_oww_models.scalar_score(prediction.get(model_key, 0.0))
+                scores = {k: em_oww_models.scalar_score(prediction.get(k, 0.0))
+                          for k in model_keys}
                 # Exactly once per chunk the MODEL saw, whatever the score —
                 # the `device.speaking` skip above returns before predict(),
                 # so the gate and the model stay in step.
@@ -3812,32 +3843,39 @@ async def _stream_listen(device: Device):
                 # against the (lower) barge threshold while a media
                 # session plays, but only when barge-in is enabled: that's
                 # the user's opt-in to trusting AEC not to self-trigger.
-                eff_threshold = device.oww_threshold
+                lowered = None
                 if device.barge_in_enabled and em_player.is_playing(device.device_id):
-                    eff_threshold = min(eff_threshold, device.barge_threshold)
+                    lowered = device.barge_threshold
                 # A ringing alarm is our own speaker output too, and louder at
                 # the mic than the person trying to dismiss it. Same opt-in as
                 # above: bargeInEnabled is the user's statement that they trust
                 # AEC here. Without it the ring stays dismissable by button and
                 # by HA — old behaviour, not a wrong answer.
                 if device.barge_in_enabled and ringing:
-                    eff_threshold = min(eff_threshold, device.barge_threshold)
+                    lowered = device.barge_threshold
+                # Every wake word against the threshold (#112); the one that
+                # crossed with the highest score is the wake, or with none
+                # crossed the closest is the near-miss. With one model this is
+                # exactly the single-model rule it replaced.
+                fired_key, score, eff_threshold = em_wake_models.judge(
+                    scores,
+                    em_wake_models.bars(model_keys, device.oww_threshold, lowered))
 
                 if trusted and 0.05 < score < eff_threshold:
                     device.oww_near_misses += 1
                     nm_pending += 1
                     nm_max = max(nm_max, float(score))
                     log.debug(
-                        f"[{device.device_id}] OWW score: {score:.3f} "
-                        f"(threshold={device.oww_threshold:.3f}, "
+                        f"[{device.device_id}] OWW score: {fired_key} {score:.3f} "
+                        f"(threshold={eff_threshold:.3f}, "
                         f"rms={rms:.4f}, floor={device.noise_floor:.4f})"
                     )
                     now = asyncio.get_event_loop().time()
                     if now - last_near_miss_log_ts >= 2.0:
                         last_near_miss_log_ts = now
                         log.info(
-                            f"[{device.device_id}] OWW near-miss: score={score:.3f} "
-                            f"(threshold={device.oww_threshold:.3f}, "
+                            f"[{device.device_id}] OWW near-miss: {fired_key} score={score:.3f} "
+                            f"(threshold={eff_threshold:.3f}, "
                             f"total near-misses={device.oww_near_misses})"
                         )
                         await api._push_event({
@@ -3888,7 +3926,7 @@ async def _stream_listen(device: Device):
                         enabled=device.wake_clip_capture,
                         minimum=device.wake_clip_min_score,
                         score=float(score), threshold=float(eff_threshold),
-                        model=current_model_name,
+                        model=current_models[model_keys.index(fired_key)],
                         device_score=(dev_wake["score"] if dev_wake is not None else None),
                         trigger_source=(source if source != "none" else None),
                     )
@@ -3921,7 +3959,9 @@ async def _stream_listen(device: Device):
                             eff_threshold = dev_wake["threshold"]
                     log.info(
                         f"[{device.device_id}] Wake word detected "
-                        f"(source={source}, score={score:.3f}, "
+                        f"(source={source}, "
+                        + (f"model={fired_key}, " if source == "controller" else "")
+                        + f"score={score:.3f}, "
                         f"threshold={eff_threshold:.3f}, "
                         f"rms={rms:.4f}, floor={device.noise_floor:.4f}"
                         + (f", scored {(loop.time() - arrived) * 1000:.0f}ms "
@@ -3987,7 +4027,11 @@ async def _stream_listen(device: Device):
                             dev_wake["at"] if source == "device" else em_shadow.now()
                         )
                         device.last_wake = {
-                            "model":       model_key,
+                            # The wake word that fired — its phrase picks HA's
+                            # pipeline. A device-detected wake does not say
+                            # which, and firmware runs one: the first.
+                            "model":       (fired_key if source == "controller"
+                                            else em_oww_models.prediction_key(device.oww_model)),
                             "score":       round(float(score), 4),
                             # The EFFECTIVE threshold this wake actually cleared,
                             # not the nominal one. During playback with barge-in
@@ -4598,9 +4642,23 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
         # than restarting a moment later; a rename sends it alone.
         if device.sendspin_capable and row["label"]:
             config = {**config, "sendspinName": row["label"]}
+        # Which wake words this Echo listens for (#112): HA's choice if it has
+        # made one, else the dashboard's. Firmware runs one, so it is told the
+        # first; the mirrors read the STORED values, where owwModel is the
+        # dashboard's model.
+        stored_config = config
+        _wake_mode = em_shadow.effective_mode(config.get("owwOnDevice"),
+                                              device.oww_trigger_capable)
+        wake_res, wake_installed = await loop.run_in_executor(
+            None, lambda: em_wake_sync.resolve_sync(
+                device_id, stored_config, mode=_wake_mode,
+                device_max=device.oww_max_models))
+        em_wake_sync.set_live(device, wake_res, wake_installed)
+        config = em_wake_models.for_device(stored_config, wake_res)
         await device.send_control({"type": "config", **config})
-        device.oww_threshold = float(config.get("owwThreshold", OWW_THRESHOLD))
+        device.oww_threshold = float(stored_config.get("owwThreshold", OWW_THRESHOLD))
         device.oww_model     = config.get("owwModel", f"{OWW_MODEL}_v0.1")
+        device.oww_default_model = stored_config.get("owwModel", f"{OWW_MODEL}_v0.1")
         device.wake_arb_ms   = int(config.get("wakeArbitrationMs", 300))
         device.mic_gain_db   = float(config.get("micGainDb", 24))
         device.adc_gains     = (int(config.get("adcMicpga", 40)),
@@ -4822,10 +4880,55 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
                     "state":     {"wake_word_enabled": t.enabled},
                 })
             em_tasks.spawn(_follow())
+        def _set_wake_models(requested: list[str], _d=_device_ref) -> None:
+            # WHICH wake words HA's two pickers chose (#112). Resolved and
+            # recorded before returning, for _set_wake_word's reason: HA reads
+            # the configuration back straight after writing it. Choosing
+            # exactly the dashboard's model clears the choice, so the Echo
+            # follows the fleet again — HA has no other way to say so.
+            offer = esphome.get_wake_offer(_d.device_id)
+            available = offer.ids() if offer is not None else set(_d.wake_installed)
+            default_id = em_oww_models.prediction_key(_d.oww_default_model)
+            override = em_wake_models.override_from_request(
+                requested, available=available, default_id=default_id)
+            res = em_wake_models.resolve(
+                default_model=_d.oww_default_model, override=override,
+                installed=_d.wake_installed,
+                max_n=em_wake_models.max_active(mode=_d.oww_on_device,
+                                                device_max=_d.oww_max_models))
+            if res == _d.wake_resolution:
+                return
+            _d.wake_resolution = res
+            _d.oww_models = res.models
+            esphome.set_wake_words_active(_d.device_id, res.active)
+            # One writer, in order: two Echoes changing at once cannot lose
+            # either write (em_db.set_wake_word_override). What is stored is
+            # what HA's pickers will show once they read this back: one over
+            # this Echo's maximum resets itself there (em_wake_models.settled).
+            stored = em_dbwriter.submit(db.set_wake_word_override, _d.device_id,
+                                        em_wake_models.settled(res, default_id))
+            log.info(f"[{_d.device_id}] Wake words {list(res.active)} "
+                     f"({'Home Assistant' if override else 'dashboard'})"
+                     + (f", not applied: {list(res.dropped)}" if res.dropped else ""))
+
+            async def _follow() -> None:
+                # The rest is an ordinary config push: the firmware is told its
+                # model (held back until installed, if it scores locally), the
+                # mirrors and HA's offer refresh, and the dashboard is told.
+                await asyncio.wrap_future(stored)
+                effective = await asyncio.get_event_loop().run_in_executor(
+                    None, db.get_effective_device_config, _d.device_id)
+                if _devices.get(_d.device_id) is _d:
+                    await api._apply_live_config(_d.device_id, _d, effective)
+            em_tasks.spawn(_follow())
         # Capabilities before the servers come up: they decide which HA
         # entities are advertised, and advertising is a one-shot at
         # ListEntities time.
         esphome.set_device_capabilities(device_id, capabilities)
+        # The wake word offer too, before the port comes up, so HA's first read
+        # carries this device's real maximum rather than the server's guess
+        # from config alone (a no-op when no server exists yet; see below).
+        await em_wake_sync.publish(device_id, device, device.wake_resolution)
         await esphome.device_connected(
             device_id,
             SERVER_HOST,
@@ -4835,6 +4938,7 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
             stop_alarm=_stop_alarm,
             start_conversation=_start_conversation,
             set_wake_word=_set_wake_word,
+            set_wake_models=_set_wake_models,
             wake_word_enabled=device.wake_word_enabled,
         )
         # #776: firmware that can honour the stored choice again (an upgrade)
@@ -4849,11 +4953,10 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
         _remute = esphome.output_mute_on_reconnect(device_id)
         if _remute is not None:
             await _send_volume_set(_remute)
-        # The ESPHome server object caches the OWW model from server
-        # creation — refresh it from the config we just loaded so HA's
-        # wake-word dropdown tracks dashboard changes across controller
-        # restarts too.
-        await esphome.update_oww_model(device_id, device.oww_model)
+        # A server created just now by device_connected built its offer from
+        # config alone; this corrects it (bouncing HA only if it already read
+        # the guess). For an existing server it is a no-op.
+        await em_wake_sync.publish(device_id, device, device.wake_resolution)
         # BT proxy: mark the device online (brings its proxy listener up if
         # enabled) and reconcile against current config — covers devices
         # approved or toggled while they were offline.

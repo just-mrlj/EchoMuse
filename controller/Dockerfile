@@ -153,6 +153,8 @@ COPY em_endpoints.py .
 COPY em_health.py .
 COPY em_button.py .
 COPY em_wakeword.py .
+COPY em_wake_models.py .
+COPY em_wake_sync.py .
 COPY em_tap_burst.py .
 COPY em_player.py .
 COPY em_config_sections.py .

@@ -528,6 +528,12 @@ comes back as pending.
 ### I re-added a device and its voice port is missing.
 Same fix, same answer: update the controller.
 
+### Can each wake word start a different assistant?
+Yes. Set **Wake word 2** and **Assistant 2** on the Echo's device page in Home
+Assistant. Each wake word then starts its own assistant. Any model installed on
+the controller can be picked, including custom ones. See
+[Two wake words, two assistants](configuration.md#two-wake-words-two-assistants).
+
 ### Can Home Assistant stop a device listening, or tell whether its microphone is muted?
 Yes to both, with two separate controls.
 
