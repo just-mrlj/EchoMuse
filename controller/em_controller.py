@@ -539,11 +539,13 @@ class Device:
         self.oww_model:     str   = f"{OWW_MODEL}_v0.1"
         # Multiple wake words (#112, em_wake_models). `oww_default_model` is
         # the dashboard's owwModel; `oww_models` the owwModel values of every
-        # wake word active on this Echo, in HA's order. `wake_resolution` is
-        # why (for the dashboard) and `wake_installed` what HA's picker
-        # callback resolves against without touching disk.
+        # wake word active on this Echo, in HA's order; `oww_thresholds` each
+        # model's own threshold, falling back to `oww_threshold`.
+        # `wake_resolution` is why (for the dashboard) and `wake_installed`
+        # what HA's picker callback resolves against without touching disk.
         self.oww_default_model: str = self.oww_model
         self.oww_models: tuple[str, ...] = (self.oww_model,)
+        self.oww_thresholds: dict = {}
         self.wake_resolution = None
         self.wake_installed: dict[str, str] = {}
         # How many wake words the firmware scores at once when it detects
@@ -1826,7 +1828,8 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
     # keys (path → stem). Every wake word this Echo listens for can barge in,
     # and the one that did names the interrupting turn's pipeline (#112).
     barge_pred_keys = tuple(em_oww_models.prediction_key(n) for n in names)
-    wake_thresholds = em_wake_models.bars(barge_pred_keys, device.oww_threshold)
+    wake_thresholds = em_wake_models.bars(barge_pred_keys, device.oww_thresholds,
+                                          device.oww_threshold)
     await _reset_wake_model(model)
     # reset() seeds the classifier's window with embeddings of random noise,
     # so the first FEATURE_WINDOW chunks score that noise as much as the room.
@@ -1903,8 +1906,8 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
                 # at a bar ten times lower than the wake threshold, while
                 # scoring the device's own speech, and cut long responses off
                 # mid-sentence (measured 2026-08-20).
-                # Each wake word on its own two frames (#112). With one model
-                # this is decide().
+                # Each wake word on its own two frames and, while thinking,
+                # its own threshold (#112). With one model this is decide().
                 many = em_barge.decide_many(
                     scores=scores,
                     prev_scores=prev_scores,
@@ -3853,13 +3856,14 @@ async def _stream_listen(device: Device):
                 # by HA — old behaviour, not a wrong answer.
                 if device.barge_in_enabled and ringing:
                     lowered = device.barge_threshold
-                # Every wake word against the threshold (#112); the one that
-                # crossed with the highest score is the wake, or with none
-                # crossed the closest is the near-miss. With one model this is
-                # exactly the single-model rule it replaced.
+                # Each wake word against its OWN threshold (#112); the one
+                # that crossed with the highest score is the wake, or with
+                # none crossed the closest is the near-miss. With one model
+                # this is exactly the single-threshold rule it replaced.
                 fired_key, score, eff_threshold = em_wake_models.judge(
                     scores,
-                    em_wake_models.bars(model_keys, device.oww_threshold, lowered))
+                    em_wake_models.bars(model_keys, device.oww_thresholds,
+                                        device.oww_threshold, lowered))
 
                 if trusted and 0.05 < score < eff_threshold:
                     device.oww_near_misses += 1
@@ -4644,8 +4648,8 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
             config = {**config, "sendspinName": row["label"]}
         # Which wake words this Echo listens for (#112): HA's choice if it has
         # made one, else the dashboard's. Firmware runs one, so it is told the
-        # first; the mirrors read the STORED values, where owwModel is the
-        # dashboard's model.
+        # first, at that model's own threshold; the mirrors read the STORED
+        # values, since oww_threshold is what every other model falls back to.
         stored_config = config
         _wake_mode = em_shadow.effective_mode(config.get("owwOnDevice"),
                                               device.oww_trigger_capable)
@@ -4654,11 +4658,14 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
                 device_id, stored_config, mode=_wake_mode,
                 device_max=device.oww_max_models))
         em_wake_sync.set_live(device, wake_res, wake_installed)
-        config = em_wake_models.for_device(stored_config, wake_res)
+        config = em_wake_models.for_device(
+            stored_config, wake_res, stored_config.get("owwThresholds"),
+            float(stored_config.get("owwThreshold", OWW_THRESHOLD)))
         await device.send_control({"type": "config", **config})
         device.oww_threshold = float(stored_config.get("owwThreshold", OWW_THRESHOLD))
         device.oww_model     = config.get("owwModel", f"{OWW_MODEL}_v0.1")
         device.oww_default_model = stored_config.get("owwModel", f"{OWW_MODEL}_v0.1")
+        device.oww_thresholds = dict(stored_config.get("owwThresholds") or {})
         device.wake_arb_ms   = int(config.get("wakeArbitrationMs", 300))
         device.mic_gain_db   = float(config.get("micGainDb", 24))
         device.adc_gains     = (int(config.get("adcMicpga", 40)),

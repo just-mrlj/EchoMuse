@@ -2397,11 +2397,11 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
               useful, was cramped at the bottom of Status). */}
           {tab === 'activity' && (() => {
             const cfgEff = effectiveConfig(globalConfig, device);
-            // Every wake word this Echo listens for (#112); a controller
-            // without wakeWords reads the configured model.
-            const wwLabel = `${device.wakeWords?.active?.length
-              ? device.wakeWords.active.map(a => a.name).join(' + ')
-              : wwModelLabel(cfgEff.owwModel)} @ ${cfgEff.owwThreshold != null ? cfgEff.owwThreshold.toFixed(2) : '—'}`;
+            // Each wake word with its own bar (#112); a controller without
+            // wakeWords reads the configured model at the configured threshold.
+            const wwLabel = device.wakeWords?.active?.length
+              ? device.wakeWords.active.map(a => `${a.name} @ ${Number(a.threshold).toFixed(2)}`).join(' + ')
+              : `${wwModelLabel(cfgEff.owwModel)} @ ${cfgEff.owwThreshold != null ? cfgEff.owwThreshold.toFixed(2) : '—'}`;
             return (
               <div style={{ minHeight:'100%', display:'flex', flexDirection:'column' }}>
                 <Panel label={`Voice activity — ${wwLabel}`} style={{ flex:1 }}>
@@ -3338,7 +3338,11 @@ function _wakeWordsRow(device, cfgEff) {
   return {
     label: parts.join(' · '),
     color: dropped.length ? 'var(--warn)' : null,
-    title: dropped.map(d => `${d.name}: ${why(d)}`).join('\n') || null,
+    title: [
+      ...ww.active.map(a => `${a.name}: threshold ${Number(a.threshold).toFixed(3)}`
+                             + (a.ownThreshold ? '' : ' (default)')),
+      ...dropped.map(d => `${d.name}: ${why(d)}`),
+    ].join('\n'),
   };
 }
 
@@ -9500,7 +9504,7 @@ const STAGE_MONO = "'DM Mono',monospace";
 // be silently wrong.
 const CONFIG_SECTIONS = {
   "playback": ["eqBands", "eqLoudness", "duckDb", "responseLevel", "limiterEnabled", "limiterThreshold", "limiterRelease", "bassGuardEnabled", "bassGuardDb", "streamReply", "volumeButtonSound"],
-  "wakeword": ["owwModel", "owwThreshold", "owwSpeexNs", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "owwOnDevice", "wakeSound", "wakeSoundLevel", "wakeClipCapture", "wakeClipMinScore"],
+  "wakeword": ["owwModel", "owwThreshold", "owwThresholds", "owwSpeexNs", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "owwOnDevice", "wakeSound", "wakeSoundLevel", "wakeClipCapture", "wakeClipMinScore"],
   "microphones": ["adcMicpga", "adcDigitalGain", "micGainDb", "beamformingEnabled", "beamAngle", "wakeMic", "aecEnabled", "aecDelayMs", "aecTailMs", "aecRefSource", "nsAsr", "saveUtterances"],
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "remoteVolumeArc", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
   "advanced": ["agcEnabled", "vadThreshold", "vadSpeechMs", "vadSilenceMs", "buttonSingleTapEvent", "buttonMultiTapMs", "consolePassword", "consoleTimeoutMin", "controllerEndpoints"],
@@ -9808,6 +9812,16 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
   const bargeT = config.bargeInThreshold ?? 0.25;
   const bargeTrack = Math.min(BARGE_T_MAX, Math.max(BARGE_T_MIN, reflectBarge(bargeT)));
   const wakeT = config.owwThreshold ?? 0.5;
+  // Each wake word's own threshold (#112), by model id — the filename stem
+  // for a custom model, which is the id Home Assistant knows it by. A model
+  // with no entry uses Sensitivity above.
+  const ownT = config.owwThresholds || {};
+  const wakeModelId = v => v.endsWith('.onnx') ? v.split('/').pop().replace(/\.onnx$/, '') : v;
+  const setOwnT = (id, t) => {
+    const next = { ...ownT };
+    if (t == null) delete next[id]; else next[id] = t;
+    set('owwThresholds', next);
+  };
 
   const bands = config.eqBands ?? [0,0,0,0,0,0,0,0];
   const RING_SCENES = [
@@ -9853,6 +9867,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
   const [advMics, setAdvMics] = useState(false);
   const [advRing, setAdvRing] = useState(false);
   const [advPlay, setAdvPlay] = useState(false);
+  const [advWake, setAdvWake] = useState(false);
 
   const inputStyle = disabled ? { opacity: 0.45, pointerEvents: 'none' } : {};
   const mono = "'DM Mono',monospace";
@@ -10142,6 +10157,39 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
             </div>
           </div>
         </div>
+        {/* Sensitivity per wake word (#112). A custom model rarely scores like
+            a stock one, so with two wake words active one may need a different
+            bar. The barge threshold stays shared. */}
+        <StageAdvanced open={advWake} onToggle={() => setAdvWake(o => !o)} disabledStyle={inputStyle}>
+          <div className="em-label" style={{ color: 'var(--muted)', marginBottom: 10 }}>
+            Sensitivity per wake word. A wake word left on default uses Sensitivity above.
+            Home Assistant chooses which are active (its Wake word and Wake word 2 settings).
+          </div>
+          <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 24px' }}>
+            {[...WW_MODELS.map(m => ({ id: m.value, label: m.label })),
+              ...customModels.map(m => ({ id: wakeModelId(m.path), label: wwModelLabel(m.path) }))]
+              .map(({ id, label }) => {
+                const own = ownT[id];
+                const t = own ?? wakeT;
+                return (
+                  <div key={id}>
+                    <Slider label={label}
+                      sub={own == null ? 'default' : 'own threshold'}
+                      value={wakeTrackFor(t)}
+                      min={WAKE_T_MIN} max={WAKE_T_MAX} step={WAKE_T_STEP}
+                      formatValue={() => t.toFixed(3)}
+                      onChange={v => setOwnT(id, reflectT(v))}/>
+                    {own != null && (
+                      <div onClick={() => setOwnT(id, null)} className="em-label"
+                        style={{ marginTop: -10, marginBottom: 8, cursor: 'pointer', color: 'var(--muted)' }}>
+                        use default
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+          </div>
+        </StageAdvanced>
       </Stage>
 
       {/* 03 MICROPHONES */}

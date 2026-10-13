@@ -10,10 +10,12 @@ written from those edges rather than from typical input.
 """
 
 import concurrent.futures
+import math
 
 import pytest
 
 import em_barge
+import em_config_types as T
 import em_db as db
 import em_dbwriter
 import em_oww_models
@@ -179,16 +181,34 @@ def test_what_is_stored_is_what_has_pickers_will_show():
     assert wm.settled(dash, "alexa_v0.1") is None
 
 
-# ── Judging a frame ──────────────────────────────────────────────────────────
+# ── Thresholds per model ─────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("value", [None, True, "0.3", math.nan, math.inf, 0, -0.1, 1.5])
+def test_a_threshold_that_is_not_a_bar_falls_back(value):
+    assert wm.threshold_for("robot", {"robot": value}, 0.5) == 0.5
+
+
+def test_own_threshold_and_fallback():
+    assert wm.threshold_for("robot", {"robot": 0.3}, 0.5) == 0.3
+    assert wm.threshold_for("alexa_v0.1", {"robot": 0.3}, 0.5) == 0.5
+    assert wm.threshold_for("robot", None, 0.5) == 0.5
+
 
 def test_the_barge_bar_only_ever_lowers():
-    assert wm.bars(["a", "b"], 0.5, lowered_to=0.25) == {"a": 0.25, "b": 0.25}
-    assert wm.bars(["a"], 0.2, lowered_to=0.25) == {"a": 0.2}
+    b = wm.bars(["a", "b"], {"a": 0.2}, 0.5, lowered_to=0.25)
+    assert b == {"a": 0.2, "b": 0.25}
 
 
 def test_one_model_is_judged_exactly_as_before():
     assert wm.judge({"a": 0.6}, {"a": 0.5}) == ("a", 0.6, 0.5)
     assert wm.judge({"a": 0.4}, {"a": 0.5}) == ("a", 0.4, 0.5)
+
+
+def test_each_model_is_judged_against_its_own_bar():
+    """The custom model at 0.35 clears its own 0.3 while the stock one at 0.45
+    misses the default 0.5: the custom one fired, though it scored lower."""
+    assert wm.judge({"robot": 0.35, "alexa": 0.45},
+                    {"robot": 0.3, "alexa": 0.5}) == ("robot", 0.35, 0.3)
 
 
 def test_of_two_that_cross_the_higher_score_wins():
@@ -220,19 +240,19 @@ def test_an_unnamed_model_falls_back_to_its_display_name():
 
 # ── What firmware that runs one model is sent ────────────────────────────────
 
-def test_one_model_firmware_is_told_the_first_wake_word():
+def test_one_model_firmware_is_told_the_first_wake_word_at_its_own_threshold():
     r = wm.resolve(default_model="hey_jarvis_v0.1", override=["robot", "alexa_v0.1"],
                    installed=INSTALLED, max_n=1)
     cfg = {"owwModel": "hey_jarvis_v0.1", "owwThreshold": 0.5, "other": 1}
-    out = wm.for_device(cfg, r)
-    assert out == {"owwModel": "/data/oww_models/robot.onnx", "owwThreshold": 0.5, "other": 1}
+    out = wm.for_device(cfg, r, {"robot": 0.3}, 0.5)
+    assert out == {"owwModel": "/data/oww_models/robot.onnx", "owwThreshold": 0.3, "other": 1}
     assert cfg["owwModel"] == "hey_jarvis_v0.1", "the stored config is not edited"
 
 
 def test_an_unchanged_config_is_passed_through():
     r = wm.resolve(default_model="alexa_v0.1", override=None, installed=INSTALLED, max_n=4)
     cfg = {"owwModel": "alexa_v0.1", "owwThreshold": 0.5}
-    assert wm.for_device(cfg, r) is cfg
+    assert wm.for_device(cfg, r, {}, 0.5) is cfg
 
 
 # ── What the dashboard is told ───────────────────────────────────────────────
@@ -240,10 +260,12 @@ def test_an_unchanged_config_is_passed_through():
 def test_the_view_shows_who_chose_and_what_was_not_applied():
     r = wm.resolve(default_model="hey_jarvis_v0.1", override=["robot", "alexa_v0.1"],
                    installed=INSTALLED, max_n=1)
-    v = wm.view(r, NAMES)
+    v = wm.view(r, NAMES, {"robot": 0.3}, 0.5)
     assert v["source"] == "ha" and v["max"] == 1
-    assert v["active"] == [{"id": "robot", "name": "hey robot (robot)"}]
-    assert v["dropped"] == [{"id": "alexa_v0.1", "name": "alexa", "reason": wm.OVER_MAX}]
+    assert v["active"] == [{"id": "robot", "name": "hey robot (robot)",
+                            "threshold": 0.3, "ownThreshold": True}]
+    assert v["dropped"] == [{"id": "alexa_v0.1", "name": "alexa",
+                             "reason": wm.OVER_MAX}]
 
 
 # ── Barge-in over several wake words ─────────────────────────────────────────
@@ -267,14 +289,32 @@ def test_two_frames_must_be_the_same_model():
     assert not many.fired
 
 
-def test_of_several_that_fire_the_highest_names_the_barge():
+def test_while_thinking_each_model_has_its_own_threshold_and_the_highest_names_it():
+    many = em_barge.decide_many(scores={"a": 0.35, "b": 0.45}, prev_scores={},
+                                in_playback=False, barge_threshold=0.25,
+                                wake_thresholds={"a": 0.3, "b": 0.5})
+    assert many.fired and many.model == "a" and many.threshold == 0.3
     many = em_barge.decide_many(scores={"a": 0.6, "b": 0.9}, prev_scores={},
                                 in_playback=False, barge_threshold=0.25,
                                 wake_thresholds={"a": 0.5, "b": 0.5})
-    assert many.fired and many.model == "b" and many.score == 0.9
+    assert many.model == "b" and many.score == 0.9
 
 
-# ── Deleting a model ─────────────────────────────────────────────────────────
+# ── Config type and ceiling ──────────────────────────────────────────────────
+
+def test_owwthresholds_is_an_object_of_numbers():
+    assert T.KINDS["owwThresholds"] == T.FLOAT_MAP
+    assert T.fits(T.FLOAT_MAP, {}) and T.fits(T.FLOAT_MAP, {"a": 0.3, "b": 1})
+    for bad in ([0.3], {"a": "0.3"}, {"a": True}, {"a": math.nan}, {1: 0.3}, None):
+        assert not T.fits(T.FLOAT_MAP, bad), bad
+
+
+def test_a_per_model_threshold_that_cannot_fire_is_clamped():
+    out = db._clamp_wake_threshold({"owwThresholds": {"a": 1.0, "b": 0.4}}, "test")
+    assert out["owwThresholds"] == {"a": db.OWW_THRESHOLD_MAX, "b": 0.4}
+    same = {"owwThresholds": {"a": 0.4}}
+    assert db._clamp_wake_threshold(same, "test") is same
+
 
 def test_a_model_ha_has_active_cannot_be_deleted(tmp_path):
     path = str(tmp_path / "robot.onnx")

@@ -32,8 +32,8 @@ const haDevices = eval(`(${lift("_haWakeWordDevices")})`);
 
 let failed = 0;
 const check = (name, cond) => { if (!cond) { failed++; console.error(`FAIL: ${name}`); } };
-const jarvis = { id: "hey_jarvis_v0.1", name: "hey jarvis" };
-const robot  = { id: "robot", name: "hey robot" };
+const jarvis = { id: "hey_jarvis_v0.1", name: "hey jarvis", threshold: 0.5, ownThreshold: false };
+const robot  = { id: "robot", name: "hey robot", threshold: 0.3, ownThreshold: true };
 
 const old = wakeWordsRow({}, { owwModel: "alexa_v0.1" });
 check("no wakeWords reads the configured model", old.label === "alexa");
@@ -41,11 +41,13 @@ check("no wakeWords claims nothing", old.color === null && old.title === null);
 
 const dash = wakeWordsRow({ wakeWords: { source: "dashboard", active: [jarvis], dropped: [], max: 4 } }, {});
 check("the dashboard's choice is just the name", dash.label === "hey jarvis");
-check("nothing dropped needs no explanation", dash.title === null);
+check("a default threshold is said to be the default", dash.title.includes("0.500 (default)"));
 
 const ha = wakeWordsRow({ wakeWords: { source: "ha", active: [jarvis, robot], dropped: [], max: 4 } }, {});
 check("HA's choice names every wake word and who chose",
       ha.label === "hey jarvis + hey robot · chosen in Home Assistant");
+check("an own threshold is shown as such", ha.title.includes("hey robot: threshold 0.300") &&
+      !ha.title.includes("0.300 (default)"));
 check("HA's choice is not a warning by itself", ha.color === null);
 
 const over = wakeWordsRow({ wakeWords: { source: "ha", active: [jarvis],

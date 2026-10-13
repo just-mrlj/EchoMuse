@@ -148,6 +148,11 @@ DEFAULT_DEVICE_CONFIG = {
     # trades recall for false positives (see oww_forge/README.md).
     "owwThreshold":     0.5,
     # The ceiling is OWW_THRESHOLD_MAX below, enforced on every write.
+    # Each wake word's own threshold, by model id (prediction key), for an
+    # Echo listening for more than one (#112): a custom model rarely scores
+    # like a stock one. A model with no entry uses owwThreshold. Controller-
+    # side; firmware that runs one model is sent that model's as owwThreshold.
+    "owwThresholds":    {},
     # Barge-in (§3.2, controller-side): wake word spoken during TTS playback
     # cancels it and starts a fresh turn. Requires device AEC (aecEnabled)
     # on — with barge-in the mic streams through playback, and AEC is what
@@ -1869,18 +1874,29 @@ def _clamp_wake_threshold(config: dict, where: str) -> dict:
     else's bug and inventing a value here would hide it. `bool` is excluded
     explicitly because it is a subclass of int in Python, so True would
     otherwise clamp to a plausible-looking 0.975.
+
+    Each model's own threshold in `owwThresholds` (#112) is held to the same
+    ceiling for the same reason.
     """
+    def _over(v) -> bool:
+        return (not isinstance(v, bool) and isinstance(v, (int, float))
+                and v > OWW_THRESHOLD_MAX)
+
     value = config.get("owwThreshold")
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return config
-    if value <= OWW_THRESHOLD_MAX:
-        return config
-    log.warning(
-        f"[db] {where}: owwThreshold {value} cannot fire — openwakeword's "
-        f"score never reaches 1.0 and the comparison is >=. Storing "
-        f"{OWW_THRESHOLD_MAX}."
-    )
-    return {**config, "owwThreshold": OWW_THRESHOLD_MAX}
+    if _over(value):
+        log.warning(
+            f"[db] {where}: owwThreshold {value} cannot fire — openwakeword's "
+            f"score never reaches 1.0 and the comparison is >=. Storing "
+            f"{OWW_THRESHOLD_MAX}."
+        )
+        config = {**config, "owwThreshold": OWW_THRESHOLD_MAX}
+    per_model = config.get("owwThresholds")
+    if isinstance(per_model, dict) and any(_over(v) for v in per_model.values()):
+        log.warning(f"[db] {where}: owwThresholds above {OWW_THRESHOLD_MAX} "
+                    f"cannot fire. Storing {OWW_THRESHOLD_MAX}.")
+        config = {**config, "owwThresholds": {
+            k: (OWW_THRESHOLD_MAX if _over(v) else v) for k, v in per_model.items()}}
+    return config
 
 
 def _clamp_wake_sample_minimum(config: dict, where: str) -> dict:

@@ -10,8 +10,8 @@ the list HA picks, and name the one that fired.
 
 Who owns what (the split proposed on #112):
 
-- The DASHBOARD owns which models are installed and the default
-  (`owwModel`).
+- The DASHBOARD owns which models are installed, the default (`owwModel`)
+  and each model's threshold (`owwThresholds`).
 - HOME ASSISTANT owns which advertised models are active on each Echo. Its
   choice is stored apart from device config (em_db, `wake_words_ha`), the
   same reason `wake_word_off` is: a dashboard save would write back a stale
@@ -41,6 +41,7 @@ Pure: no I/O, no aiohttp, no db. em_wake_sync does the reading and writing.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import em_oww_models
@@ -235,18 +236,31 @@ def settled(res: Resolution, default_id: str) -> list[str] | None:
     return None if ids == [default_id] else ids
 
 
-def bars(ids, default: float, lowered_to: float | None = None) -> dict[str, float]:
+def threshold_for(model_id: str, thresholds, default: float) -> float:
+    """This model's wake threshold: its own entry, else the default.
+    An entry that is not a number in (0, 1] is ignored, not trusted."""
+    v = thresholds.get(model_id) if isinstance(thresholds, dict) else None
+    if (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v) and 0.0 < v <= 1.0):
+        return float(v)
+    return float(default)
+
+
+def bars(ids, thresholds, default: float, lowered_to: float | None = None) -> dict[str, float]:
     """Each model's bar for this frame. `lowered_to` is the barge-in bar while
     our own audio is playing; it only ever lowers a model's bar."""
-    t = float(default)
-    return {i: (min(t, lowered_to) if lowered_to is not None else t) for i in ids}
+    out = {}
+    for i in ids:
+        t = threshold_for(i, thresholds, default)
+        out[i] = min(t, lowered_to) if lowered_to is not None else t
+    return out
 
 
 def judge(scores: dict[str, float], frame_bars: dict[str, float]) -> tuple[str, float, float]:
     """
     (model, score, bar) for one frame.
 
-    Each model is judged against its bar. Of the models that crossed, the
+    Each model is judged against its OWN bar. Of the models that crossed, the
     highest score wins. When none crossed, the one closest to its bar is
     reported, which is what the near-miss counters want. With one model both
     reduce to that model, so single-wake-word behaviour is unchanged.
@@ -272,30 +286,41 @@ def phrase(fired_id: str | None, names: dict[str, str], active) -> str:
     return em_oww_models.display_name(key) if key else ""
 
 
-def for_device(config: dict, resolution: Resolution) -> dict:
+def for_device(config: dict, resolution: Resolution, thresholds, default: float) -> dict:
     """
     The config to push to firmware that runs ONE model.
 
-    Such an Echo only reads `owwModel`, so it is sent the first wake word this
-    device listens for. Without this an Echo detecting its own wake word would
-    ignore Home Assistant's choice entirely.
+    Such an Echo only reads `owwModel` and `owwThreshold`, so they are sent as
+    the active model and its own threshold. Without this an Echo detecting its
+    own wake word would ignore Home Assistant's choice entirely, and a
+    per-model threshold would never reach it.
     """
     model = resolution.models[0]
-    if config.get("owwModel") == model:
+    threshold = threshold_for(resolution.active[0], thresholds, default)
+    if config.get("owwModel") == model and config.get("owwThreshold") == threshold:
         return config
     out = dict(config)
     out["owwModel"] = model
+    out["owwThreshold"] = threshold
     return out
 
 
-def view(resolution: Resolution, names: dict[str, str]) -> dict:
+def view(resolution: Resolution, names: dict[str, str], thresholds, default: float) -> dict:
     """What the dashboard shows for one Echo (`wakeWords` in /api/devices)."""
     def _name(i: str) -> str:
         return names.get(i) or em_oww_models.display_name(i)
 
+    def _custom(i: str) -> bool:
+        return isinstance(thresholds, dict) and threshold_for(i, thresholds, -1.0) != -1.0
+
     return {
         "source": resolution.source,
-        "active": [{"id": i, "name": _name(i)} for i in resolution.active],
+        "active": [
+            {"id": i, "name": _name(i),
+             "threshold": threshold_for(i, thresholds, default),
+             "ownThreshold": _custom(i)}
+            for i in resolution.active
+        ],
         "dropped": [{"id": i, "name": _name(i), "reason": r}
                     for i, r in resolution.dropped],
         "max": resolution.max,

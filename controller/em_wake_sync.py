@@ -155,7 +155,7 @@ def view_of(live) -> dict | None:
     res = getattr(live, "wake_resolution", None)
     if res is None:
         return None
-    return wm.view(res, _names(live.device_id))
+    return wm.view(res, _names(live.device_id), live.oww_thresholds, live.oww_threshold)
 
 
 def view_for(device_id: str, live) -> dict | None:
@@ -166,7 +166,8 @@ def view_for(device_id: str, live) -> dict | None:
         return view_of(live)
     cfg = db.get_effective_device_config(device_id) or {}
     res, _ = resolve_sync(device_id, cfg, mode=mode_of(None, cfg), device_max=None)
-    return wm.view(res, _names(device_id))
+    return wm.view(res, _names(device_id), cfg.get("owwThresholds") or {},
+                   float(cfg.get("owwThreshold", 0.5)))
 
 
 async def publish(device_id: str, live, res: wm.Resolution) -> None:

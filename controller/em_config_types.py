@@ -34,6 +34,7 @@ FLOAT = "a number"
 BOOL = "true or false"
 STR = "a string"
 FLOAT_LIST = "a list of numbers"
+FLOAT_MAP = "an object of numbers"
 
 KINDS: dict[str, str] = {
     # Decoded by the device (device/internal/config ConfigMessage).
@@ -80,6 +81,7 @@ KINDS: dict[str, str] = {
     "wakeArbitrationMs": INT,
     "streamReply": BOOL,
     "owwSpeexNs": BOOL,
+    "owwThresholds": FLOAT_MAP,
     "nsAsr": BOOL,
     "saveUtterances": BOOL,
     "wakeClipCapture": BOOL,
@@ -105,6 +107,9 @@ def fits(kind: str, value) -> bool:
         return isinstance(value, str)
     if kind == FLOAT_LIST:
         return isinstance(value, list) and all(_number(x) for x in value)
+    if kind == FLOAT_MAP:
+        return (isinstance(value, dict)
+                and all(isinstance(k, str) and _number(v) for k, v in value.items()))
     raise ValueError(f"unknown kind: {kind}")
 
 

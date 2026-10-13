@@ -104,7 +104,7 @@ def test_a_newer_resolution_wins_when_naming_finishes_out_of_order(monkeypatch):
     first = wm.Resolution(("a",), ("a",), "dashboard", ("a",))
     second = wm.Resolution(("b",), ("b",), "ha", ("b",))
     live = SimpleNamespace(device_id="device", wake_resolution=first,
-                           oww_threshold=0.5)
+                           oww_thresholds={}, oww_threshold=0.5)
 
     async def run():
         started, release = asyncio.Event(), asyncio.Event()

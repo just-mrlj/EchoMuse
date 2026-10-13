@@ -1336,10 +1336,10 @@ async def _apply_live_config(device_id: str, live, effective: dict) -> None:
     body is partial by design, and a device must always be sent the whole
     resolved picture.
 
-    The firmware is sent ONE wake word, the first this device listens for
-    (em_wake_models.for_device): HA may have chosen a different one from the
-    dashboard's (#112). `effective` itself, the stored values, is what the
-    mirrors read.
+    The firmware is sent ONE wake word, the first this device listens for, at
+    that model's own threshold (em_wake_models.for_device): HA may have chosen
+    a different one from the dashboard's (#112). `effective` itself, the stored
+    values, is what the mirrors read.
 
     One key is held back: a NEW `owwModel` is not sent to a device that scores
     locally until the classifier is actually on it — see _hold_back_oww_model.
@@ -1350,11 +1350,15 @@ async def _apply_live_config(device_id: str, live, effective: dict) -> None:
         device_id, live, effective,
         mode=em_shadow.effective_mode(effective.get("owwOnDevice", live.oww_on_device),
                                       live.oww_trigger_capable))
-    to_send = em_wake_models.for_device(effective, wake_res)
+    to_send = em_wake_models.for_device(
+        effective, wake_res, effective.get("owwThresholds"),
+        float(effective.get("owwThreshold", live.oww_threshold)))
     to_send, pending_model = _hold_back_oww_model(live, to_send)
     await live.send_control({"type": "config", **to_send})
     if "owwThreshold" in effective:
         live.oww_threshold = float(effective["owwThreshold"])
+    if "owwThresholds" in effective:
+        live.oww_thresholds = dict(effective["owwThresholds"] or {})
     if "owwModel" in effective:
         live.oww_default_model = effective["owwModel"]
         live.oww_model = to_send["owwModel"]
@@ -4876,7 +4880,9 @@ async def _install_then_switch(device_id: str, model: str) -> None:
         None, db.get_effective_device_config, device_id
     ))
     wake_res = await em_wake_sync.resolve(device_id, live, effective)
-    to_send = em_wake_models.for_device(effective, wake_res)
+    to_send = em_wake_models.for_device(
+        effective, wake_res, effective.get("owwThresholds"),
+        float(effective.get("owwThreshold", live.oww_threshold)))
     if (to_send.get("owwModel") or "").strip() != model:
         # Changed again while the push was running (a save, or Home
         # Assistant); that change owns the outcome and has its own install task.

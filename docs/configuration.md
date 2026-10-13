@@ -321,8 +321,8 @@ included. Upload a model here first if you want to use it there.
 
 Who decides what:
 
-- **The dashboard** decides which models are installed and the default wake
-  word (the tiles above).
+- **The dashboard** decides which models are installed, the default wake word
+  (the tiles above) and each word's sensitivity.
 - **Home Assistant** decides which of them each Echo listens for. Its choice
   replaces the dashboard's wake word for that Echo only. The Status tab shows
   the words in use and says **chosen in Home Assistant**, and Config → Wake
@@ -341,6 +341,14 @@ How many at once depends on where the wake word is detected:
 
 Home Assistant does not filter the lists by language. The stock words are
 English models, and they appear and work with an assistant in any language.
+
+### Sensitivity per wake word
+
+Under **Advanced** in this section, each installed wake word can have its own
+sensitivity. A word left on **default** uses the Sensitivity slider above.
+Custom models often score differently from the stock ones, so with two words
+active you may need to make one stricter or more eager than the other. The
+**barge threshold** (a wake word spoken over a reply) is shared by every word.
 
 ### Arbitration window
 With more than one Echo, saying the wake word in earshot of two of them
