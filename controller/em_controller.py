@@ -3571,7 +3571,8 @@ async def _stream_listen(device: Device):
     # the prediction dict by the filename stem — never score by the raw name.
     model_keys = tuple(em_oww_models.prediction_key(m) for m in current_models)
 
-    log.info(f"[{device.device_id}] OWW: starting (initial threshold={device.oww_threshold:.3f})")
+    log.info(f"[{device.device_id}] OWW: starting (thresholds: "
+             f"{em_wake_models.describe_thresholds(model_keys, device.oww_thresholds, device.oww_threshold)})")
     await device.mic_start()
 
     buf = bytearray()
@@ -3621,7 +3622,9 @@ async def _stream_listen(device: Device):
                     buf.clear()
                     # A new model is noise-seeded exactly like a reset one.
                     warmup.reset()
-                    log.info(f"[{device.device_id}] OWW: reloaded → {', '.join(new_models)} (speex_ns={new_speex})")
+                    log.info(f"[{device.device_id}] OWW: reloaded → {', '.join(new_models)} "
+                             f"(speex_ns={new_speex}, thresholds: "
+                             f"{em_wake_models.describe_thresholds(model_keys, device.oww_thresholds, device.oww_threshold)})")
                 except Exception as e:
                     log.error(
                         f"[{device.device_id}] OWW: failed to load {', '.join(new_models)} "

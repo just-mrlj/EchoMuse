@@ -199,6 +199,31 @@ def test_the_barge_bar_only_ever_lowers():
     assert b == {"a": 0.2, "b": 0.25}
 
 
+def test_the_startup_line_names_each_wake_words_own_bar():
+    """One "threshold=" named only the default, so a model with its own entry
+    could not be seen to have it (found in testing, 2026-10-13)."""
+    assert wm.describe_thresholds(["alexa_v0.1", "hey_jarvis_v0.1"], {"alexa_v0.1": 0.4}, 0.5) == (
+        "alexa_v0.1=0.400, hey_jarvis_v0.1=0.500 (default)")
+
+
+def test_a_save_reports_each_bar_it_moved():
+    ids = ("alexa_v0.1", "hey_jarvis_v0.1")
+    # A per-model slider moved.
+    assert wm.threshold_changes(ids, ({}, 0.5), ({"alexa_v0.1": 0.4}, 0.5)) == [
+        "alexa_v0.1 0.500 → 0.400"]
+    # The default moved: only the models that follow it.
+    assert wm.threshold_changes(ids, ({"alexa_v0.1": 0.4}, 0.5), ({"alexa_v0.1": 0.4}, 0.6)) == [
+        "hey_jarvis_v0.1 0.500 → 0.600 (default)"]
+    # "use default" on a model.
+    assert wm.threshold_changes(ids, ({"alexa_v0.1": 0.4}, 0.5), ({}, 0.5)) == [
+        "alexa_v0.1 0.400 → 0.500 (default)"]
+    # A model this Echo is not listening for still leaves a line.
+    assert wm.threshold_changes(ids, ({}, 0.5), ({"robot": 0.3}, 0.5)) == [
+        "robot 0.500 → 0.300 (not listening for it)"]
+    # Nothing moved, nothing said.
+    assert wm.threshold_changes(ids, ({"alexa_v0.1": 0.4}, 0.5), ({"alexa_v0.1": 0.4}, 0.5)) == []
+
+
 def test_one_model_is_judged_exactly_as_before():
     assert wm.judge({"a": 0.6}, {"a": 0.5}) == ("a", 0.6, 0.5)
     assert wm.judge({"a": 0.4}, {"a": 0.5}) == ("a", 0.4, 0.5)

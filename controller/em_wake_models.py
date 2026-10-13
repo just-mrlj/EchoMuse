@@ -246,6 +246,45 @@ def threshold_for(model_id: str, thresholds, default: float) -> float:
     return float(default)
 
 
+def describe_thresholds(ids, thresholds, default: float) -> str:
+    """Each wake word's bar for a log line:
+    "alexa_v0.1=0.400, hey_jarvis_v0.1=0.500 (default)". With several wake
+    words a single "threshold=" names only the default, which is not what
+    any model with its own entry is held to."""
+    parts = []
+    for i in ids:
+        own = threshold_for(i, thresholds, -1.0)
+        parts.append(f"{i}={own:.3f}" if own != -1.0 else f"{i}={float(default):.3f} (default)")
+    return ", ".join(parts)
+
+
+def threshold_changes(ids, before: tuple[dict, float], after: tuple[dict, float]) -> list[str]:
+    """
+    Each wake word whose bar a save moved, as "alexa_v0.1 0.500 → 0.400".
+
+    `before` and `after` are (owwThresholds, owwThreshold). `ids` are the wake
+    words this Echo listens for, reported first; a model with an entry in
+    either map is reported too, marked as one it is not listening for, so a
+    slider moved for any model leaves a line rather than nothing.
+    """
+    (b_map, b_default), (a_map, a_default) = before, after
+    others = sorted(
+        {k for m in (b_map, a_map) if isinstance(m, dict) for k in m} - set(ids))
+    out = []
+    for i in list(ids) + others:
+        old = threshold_for(i, b_map, b_default)
+        new = threshold_for(i, a_map, a_default)
+        if round(old, 3) == round(new, 3):
+            continue
+        line = f"{i} {old:.3f} → {new:.3f}"
+        if threshold_for(i, a_map, -1.0) == -1.0:
+            line += " (default)"
+        if i not in ids:
+            line += " (not listening for it)"
+        out.append(line)
+    return out
+
+
 def bars(ids, thresholds, default: float, lowered_to: float | None = None) -> dict[str, float]:
     """Each model's bar for this frame. `lowered_to` is the barge-in bar while
     our own audio is playing; it only ever lowers a model's bar."""

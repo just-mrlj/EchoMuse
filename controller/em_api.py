@@ -1355,10 +1355,17 @@ async def _apply_live_config(device_id: str, live, effective: dict) -> None:
         float(effective.get("owwThreshold", live.oww_threshold)))
     to_send, pending_model = _hold_back_oww_model(live, to_send)
     await live.send_control({"type": "config", **to_send})
+    thresholds_before = (dict(live.oww_thresholds), live.oww_threshold)
     if "owwThreshold" in effective:
         live.oww_threshold = float(effective["owwThreshold"])
     if "owwThresholds" in effective:
         live.oww_thresholds = dict(effective["owwThresholds"] or {})
+    # Thresholds are read per frame, so a change takes effect without a
+    # reload and would otherwise leave no trace: say which bar moved.
+    threshold_changes = em_wake_models.threshold_changes(
+        wake_res.active, thresholds_before, (live.oww_thresholds, live.oww_threshold))
+    if threshold_changes:
+        log.info(f"[api] [{device_id}] wake thresholds: {'; '.join(threshold_changes)}")
     if "owwModel" in effective:
         live.oww_default_model = effective["owwModel"]
         live.oww_model = to_send["owwModel"]
